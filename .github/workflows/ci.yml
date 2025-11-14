@@ -1,0 +1,86 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  test:
+    name: Database Connection Test
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+          MYSQL_DATABASE: ${{ vars.DB_NAME }}
+          MYSQL_USER: ${{ vars.DB_USER }}
+          MYSQL_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./scrap-services
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Wait for MySQL to be ready
+        run: sleep 10
+
+      - name: Initialize database schema
+        working-directory: ./scrap-services
+        run: |
+          mysql -h ${{ vars.DB_HOST }} -P ${{ vars.DB_PORT }} -u ${{ vars.DB_USER }} -p${{ secrets.DB_PASSWORD }} ${{ vars.DB_NAME }} < init.sql
+
+      - name: Run database connection test
+        working-directory: ./scrap-services
+        run: pytest tests/test_db_connection.py -v --tb=short
+        continue-on-error: false
+        env:
+          DB_HOST: ${{ vars.DB_HOST }}
+          DB_PORT: ${{ vars.DB_PORT }}
+          DB_USER: ${{ vars.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ vars.DB_NAME }}
+          API_KEY: ${{ secrets.API_KEY }}
+          HEADLESS_MODE: true
+          LOG_LEVEL: INFO
+          SCREENSHOT_ENABLED: false
+          SCRAPE_DELAY: 1
+
+      - name: Fail job if tests failed
+        if: failure()
+        run: |
+          echo "::error::Database connection tests failed. Merge blocked."
+          exit 1
+
+      - name: Test Results Summary
+        if: always()
+        run: |
+          echo "## 🧪 Database Connection Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ $? -eq 0 ]; then
+            echo "✅ All database tests passed successfully!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Database tests failed. Check logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
