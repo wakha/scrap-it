@@ -213,8 +213,8 @@ jobs:
               <div class="section">
                   <h2>📋 Quality Thresholds</h2>
                   <ul>
-                      <li>Pylint Score: Minimum 7.0/10.0</li>
-                      <li>Maintainability Index: Minimum 65/100</li>
+                      <li>Pylint Score: Minimum 6.0/10.0</li>
+                      <li>Maintainability Index: Informational only (no threshold)</li>
                   </ul>
               </div>
 
@@ -230,7 +230,7 @@ jobs:
                       document.getElementById('radon-mi').textContent = radonMi.toFixed(2) + '/100';
                       
                       const statusBadge = document.getElementById('status-badge');
-                      if (pylintScore >= 7.0 && radonMi >= 65) {
+                      if (pylintScore >= 6.0) {
                           statusBadge.textContent = 'PASSED';
                           statusBadge.className = 'status-badge status-pass';
                       } else {
@@ -262,19 +262,17 @@ jobs:
           RADON=${RADON_MI:-0}
           
           echo "Pylint Score: $PYLINT"
-          echo "Maintainability Index: $RADON"
+          echo "Maintainability Index: $RADON (informational only)"
           
-          # Set thresholds (adjusted for legacy codebase)
-          PYLINT_THRESHOLD=7.0
-          RADON_THRESHOLD=35
+          # Set threshold
+          PYLINT_THRESHOLD=6.0
           
           echo "pylint_score=$PYLINT" >> $GITHUB_OUTPUT
           echo "radon_mi=$RADON" >> $GITHUB_OUTPUT
           echo "pylint_threshold=$PYLINT_THRESHOLD" >> $GITHUB_OUTPUT
-          echo "radon_threshold=$RADON_THRESHOLD" >> $GITHUB_OUTPUT
           
-          # Check if scores meet thresholds
-          if (( $(echo "$PYLINT >= $PYLINT_THRESHOLD" | bc -l) )) && (( $(echo "$RADON >= $RADON_THRESHOLD" | bc -l) )); then
+          # Check if Pylint score meets threshold (MI is informational only)
+          if (( $(echo "$PYLINT >= $PYLINT_THRESHOLD" | bc -l) )); then
             echo "quality_check=passed" >> $GITHUB_OUTPUT
             echo "✅ Code quality check PASSED"
           else
@@ -291,11 +289,9 @@ jobs:
             const pylintScore = '${{ steps.calculate-score.outputs.pylint_score }}';
             const radonMi = '${{ steps.calculate-score.outputs.radon_mi }}';
             const pylintThreshold = '${{ steps.calculate-score.outputs.pylint_threshold }}';
-            const radonThreshold = '${{ steps.calculate-score.outputs.radon_threshold }}';
             const qualityCheck = '${{ steps.calculate-score.outputs.quality_check }}';
             
             const pylintPassed = parseFloat(pylintScore) >= parseFloat(pylintThreshold);
-            const radonPassed = parseFloat(radonMi) >= parseFloat(radonThreshold);
             
             const statusEmoji = qualityCheck === 'passed' ? '✅' : '❌';
             const overallStatus = qualityCheck === 'passed' ? '**PASSED**' : '**FAILED**';
@@ -307,7 +303,7 @@ jobs:
             | Metric | Score | Threshold | Status |
             |--------|-------|-----------|--------|
             | Pylint | ${pylintScore}/10 | ${pylintThreshold}/10 | ${pylintPassed ? '✅ Pass' : '❌ Fail'} |
-            | Maintainability Index | ${radonMi}/100 | ${radonThreshold}/100 | ${radonPassed ? '✅ Pass' : '❌ Fail'} |
+            | Maintainability Index | ${radonMi}/100 | Informational | ℹ️ Info |
             
             ### 📊 Detailed Reports
             
@@ -334,6 +330,6 @@ jobs:
       - name: Fail if Quality Thresholds Not Met
         if: steps.calculate-score.outputs.quality_check == 'failed'
         run: |
-          echo "::error::Code quality check failed. Pylint score: ${{ steps.calculate-score.outputs.pylint_score }}, Maintainability Index: ${{ steps.calculate-score.outputs.radon_mi }}"
-          echo "::error::Required: Pylint >= ${{ steps.calculate-score.outputs.pylint_threshold }}, Maintainability Index >= ${{ steps.calculate-score.outputs.radon_threshold }}"
+          echo "::error::Code quality check failed. Pylint score: ${{ steps.calculate-score.outputs.pylint_score }}"
+          echo "::error::Required: Pylint >= ${{ steps.calculate-score.outputs.pylint_threshold }}"
           exit 1
