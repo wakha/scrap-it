@@ -105,6 +105,18 @@ class Settings(BaseSettings):
         "/store-locator/",
         "/stores/",
         "/locations/",
+        "/story/",
+        "/stories/",
+        "/guides/",
+        "/tips/",
+        "/advice/",
+        "/campaign/",
+        "/campaigns/",
+        "/promotion/",
+        "/promotions/",
+        "/inspiration/",
+        "/editorial/",
+        "/magazine/",
     ]
 
     # Cookie Consent Selectors (Danish + English)
@@ -431,30 +443,6 @@ class Settings(BaseSettings):
         'button:has-text("View more")',
         "summary",
         'button[aria-expanded="false"]',
-    ]
-
-    # Non-Product URL Patterns
-    non_product_patterns: List[str] = [
-        "/blog/",
-        "/article/",
-        "/news/",
-        "/story/",
-        "/stories/",
-        "/category/",
-        "/categories/",
-        "/collection/",
-        "/collections/",
-        "/guide/",
-        "/guides/",
-        "/tips/",
-        "/advice/",
-        "/campaign/",
-        "/campaigns/",
-        "/promotion/",
-        "/promotions/",
-        "/inspiration/",
-        "/editorial/",
-        "/magazine/",
     ]
 
     # Default Values
