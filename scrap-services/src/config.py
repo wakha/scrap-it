@@ -1,40 +1,52 @@
 """Configuration settings for the scraper application."""
 from typing import List
+
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    """Application settings."""
-    
+    """
+    Application settings loaded from environment variables.
+
+    Centralizes all configuration for the scraper application including:
+    - Database connection settings
+    - Browser automation parameters
+    - Retry and timeout configurations
+    - Selector patterns for common UI elements
+    - Test data for checkout flows
+
+    All settings can be overridden via .env file.
+    """
+
     # Database
     db_host: str
     db_port: int
     db_user: str
     db_password: str
     db_name: str
-    
+
     # Database Pool
     db_pool_size: int = 10
     db_max_overflow: int = 20
-    
+
     # Logging
     log_level: str = "INFO"
-    
+
     # Scraper Browser Settings
     headless_mode: bool
     screenshot_enabled: bool
     scrape_delay: int
-    
+
     # API Security
     api_key: str = "your-api-key-here"
-    
+
     # Retry & Timeout Settings
     max_retries: int = 3
     page_timeout: int = 30000  # milliseconds
     navigation_timeout: int = 10000  # milliseconds
     element_timeout: int = 5000  # milliseconds
     cookie_dismiss_timeout: int = 3000  # milliseconds
-    
+
     # Sleep/Wait Times (in seconds)
     dynamic_content_wait: float = 1.0
     page_update_wait: float = 1.0
@@ -42,10 +54,10 @@ class Settings(BaseSettings):
     variant_select_wait: float = 0.5
     checkout_step_wait: float = 1.0
     validation_retry_wait: float = 1.0
-    
+
     # Checkout Settings
     max_checkout_steps: int = 5
-    
+
     # Test Data for Checkout Forms
     test_email: str = "test@example.com"
     test_first_name: str = "Test"
@@ -55,24 +67,46 @@ class Settings(BaseSettings):
     test_postal_code: str = "2860"
     test_city: str = "Søborg"
     test_country: str = "Denmark"
-    
+
     # Product Discovery
     max_discovery_attempts: int = 2
     max_validation_attempts: int = 5  # Validate more candidates for better success rate
-    
+
     # Non-product URL patterns (for filtering)
     non_product_patterns: List[str] = [
-        '/blog/', '/article/', '/news/', '/press/',
-        '/category/', '/categories/', '/collection/', '/collections/',
-        '/search/', '/tag/', '/tags/',
-        '/about/', '/contact/', '/help/', '/support/',
-        '/account/', '/login/', '/register/', '/signup/',
-        '/cart/', '/basket/', '/checkout/',
-        '/terms/', '/privacy/', '/policy/',
-        '/faq/', '/guide/', '/tutorial/',
-        '/store-locator/', '/stores/', '/locations/',
+        "/blog/",
+        "/article/",
+        "/news/",
+        "/press/",
+        "/category/",
+        "/categories/",
+        "/collection/",
+        "/collections/",
+        "/search/",
+        "/tag/",
+        "/tags/",
+        "/about/",
+        "/contact/",
+        "/help/",
+        "/support/",
+        "/account/",
+        "/login/",
+        "/register/",
+        "/signup/",
+        "/cart/",
+        "/basket/",
+        "/checkout/",
+        "/terms/",
+        "/privacy/",
+        "/policy/",
+        "/faq/",
+        "/guide/",
+        "/tutorial/",
+        "/store-locator/",
+        "/stores/",
+        "/locations/",
     ]
-    
+
     # Cookie Consent Selectors (Danish + English)
     cookie_selectors: List[str] = [
         'button:has-text("Acceptér alle")',
@@ -89,35 +123,35 @@ class Settings(BaseSettings):
         'button[id*="cookie"]',
         'button[class*="accept"]',
         'button[class*="cookie"]',
-        '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
-        '.cookie-accept',
-        '.accept-cookies',
-        '.coi-accept-all',
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        ".cookie-accept",
+        ".accept-cookies",
+        ".coi-accept-all",
         '[data-test*="cookie"][data-test*="accept"]',
     ]
-    
+
     # Variant/Size Selectors
     variant_selectors: List[str] = [
-        'table.variations select',
-        '.variations select',
-        'select.variation_select',
+        "table.variations select",
+        ".variations select",
+        "select.variation_select",
         'select[name^="attribute_"]',
         'label[for*="size"]',
         'label[for*="variant"]',
         'button[data-test*="size"]',
-        'a.size-option',
-        'button[data-size]',
+        "a.size-option",
+        "button[data-size]",
         'button[class*="size"]',
-        '.size-selector button',
+        ".size-selector button",
         'select[data-test="select-size"]',
         'select[name*="size"]',
         'select[name*="variant"]',
         'select[name*="antal"]',
         'input[type="radio"][name*="size"]',
         'input[type="radio"][name*="variant"]',
-        '[data-size]',
+        "[data-size]",
     ]
-    
+
     # Add to Cart Button Selectors (Danish + English)
     add_to_cart_selectors: List[str] = [
         'button:has-text("Læg i kurv")',
@@ -139,15 +173,15 @@ class Settings(BaseSettings):
         'a[id*="add-to-cart"]',
         'button[id*="addToCart"]',
         'a[id*="addToCart"]',
-        '.add-to-cart',
-        '#add-to-cart-button',
+        ".add-to-cart",
+        "#add-to-cart-button",
         '[data-test="add-to-cart"]',
         'button:has-text("Køb")[class*="buy"]',
         'button:has-text("Køb")[class*="cart"]',
         'a:has-text("Køb")[class*="buy"]',
         'a:has-text("Køb")[class*="cart"]',
     ]
-    
+
     # Cart Validation Indicator Selectors
     cart_indicator_selectors: List[str] = [
         '[class*="cart-modal"]',
@@ -157,10 +191,10 @@ class Settings(BaseSettings):
         '[id*="cart-modal"]',
         '[class*="kurv"]',
         '[class*="Kurv"]',
-        'text=er tilføjet',
-        'text=tilføjet til kurv',
-        'text=added to cart',
-        'text=tilføjet',
+        "text=er tilføjet",
+        "text=tilføjet til kurv",
+        "text=added to cart",
+        "text=tilføjet",
         '[class*="success"]',
         '[class*="notification"]',
         '[class*="cart-item"]',
@@ -175,20 +209,20 @@ class Settings(BaseSettings):
         'a:has-text("Se kurv")',
         'button:has-text("Gå til kurv")',
     ]
-    
+
     # Cart Quantity Indicator Selectors
     cart_quantity_selectors: List[str] = [
         '[class*="cart-count"]',
         '[class*="cart-quantity"]',
         '[class*="basket-count"]',
         '[id*="cart-count"]',
-        '.cart-badge',
-        '.cart-counter',
+        ".cart-badge",
+        ".cart-counter",
         '[class*="cart-badge"]',
         '[class*="CartBadge"]',
         '[data-test*="cart-count"]',
     ]
-    
+
     # Checkout/Cart Link Selectors
     checkout_selectors: List[str] = [
         'a:has-text("Gå til kassen")',
@@ -204,11 +238,11 @@ class Settings(BaseSettings):
         'a[href*="/cart"]',
         'a[href*="/kurv"]',
         'a[href*="/kassen"]',
-        '.checkout-button',
-        '#checkout-button',
+        ".checkout-button",
+        "#checkout-button",
         '[data-test="checkout"]',
     ]
-    
+
     # Checkout Button Selectors (on cart page)
     checkout_button_selectors: List[str] = [
         'button:has-text("Gå til kassen")',
@@ -219,7 +253,7 @@ class Settings(BaseSettings):
         '[class*="checkout"][type="button"]',
         '[class*="proceed"][type="button"]',
     ]
-    
+
     # Checkout Form Field Selectors
     combined_name_selectors: List[str] = [
         'input[name="name"]:not([name*="first"]):not([name*="last"])',
@@ -230,16 +264,16 @@ class Settings(BaseSettings):
         'input[name*="fullname" i]',
         'input[name*="full_name" i]',
     ]
-    
+
     email_selectors: List[str] = [
         'input[type="email"]',
         'input[name*="email" i]',
         'input[id*="email" i]',
         'input[placeholder*="email" i]',
-        '#billing_email',
-        '#email',
+        "#billing_email",
+        "#email",
     ]
-    
+
     first_name_selectors: List[str] = [
         'input[name*="first" i][name*="name" i]',
         'input[name*="fornavn" i]',
@@ -249,9 +283,9 @@ class Settings(BaseSettings):
         'input[name="firstName"]',
         'input[name="firstname"]',
         'input[id="firstName"]',
-        '#billing_first_name',
+        "#billing_first_name",
     ]
-    
+
     last_name_selectors: List[str] = [
         'input[name*="last" i][name*="name" i]',
         'input[name*="efternavn" i]',
@@ -261,9 +295,9 @@ class Settings(BaseSettings):
         'input[name="lastName"]',
         'input[name="lastname"]',
         'input[id="lastName"]',
-        '#billing_last_name',
+        "#billing_last_name",
     ]
-    
+
     phone_selectors: List[str] = [
         'input[type="tel"]',
         'input[name*="phone" i]',
@@ -271,9 +305,9 @@ class Settings(BaseSettings):
         'input[id*="phone" i]',
         'input[placeholder*="phone" i]',
         'input[placeholder*="telefon" i]',
-        '#billing_phone',
+        "#billing_phone",
     ]
-    
+
     address_selectors: List[str] = [
         'input[name*="address" i]:not([name*="2"])',
         'input[name*="adresse" i]:not([name*="2"])',
@@ -284,9 +318,9 @@ class Settings(BaseSettings):
         'input[name="address"]',
         'input[name="streetAddress"]',
         'input[id="address"]',
-        '#billing_address_1',
+        "#billing_address_1",
     ]
-    
+
     postal_code_selectors: List[str] = [
         'input[name*="postal" i]',
         'input[name*="zip" i]',
@@ -294,18 +328,18 @@ class Settings(BaseSettings):
         'input[id*="postal" i]',
         'input[placeholder*="postal" i]',
         'input[placeholder*="postnummer" i]',
-        '#billing_postcode',
+        "#billing_postcode",
     ]
-    
+
     city_selectors: List[str] = [
         'input[name*="city" i]',
         'input[name*="by" i]',
         'input[id*="city" i]',
         'input[placeholder*="city" i]',
         'input[placeholder*="by" i]',
-        '#billing_city',
+        "#billing_city",
     ]
-    
+
     # Next/Continue Button Selectors (for multi-step checkout)
     next_button_selectors: List[str] = [
         'button:has-text("Næste")',
@@ -329,38 +363,64 @@ class Settings(BaseSettings):
         'a[class*="continue"]',
         'a[class*="next"]',
     ]
-    
+
     # Delivery Type Classification Keywords
     home_delivery_keywords: List[str] = [
-        'hjemmelevering', 'hjemlevering', 'home delivery', 'levering til døren',
-        'delivery to door', 'door delivery', 'hjemme', 'til døren', 
-        'leveres hjem', 'burd', 'courier'
+        "hjemmelevering",
+        "hjemlevering",
+        "home delivery",
+        "levering til døren",
+        "delivery to door",
+        "door delivery",
+        "hjemme",
+        "til døren",
+        "leveres hjem",
+        "burd",
+        "courier",
     ]
-    
+
     parcel_shop_keywords: List[str] = [
-        'pakkeshop', 'parcel shop', 'afhentning', 'pakkeboks',
-        'pickup', 'collect', 'afhentn', 'pakkehop', 'shop'
+        "pakkeshop",
+        "parcel shop",
+        "afhentning",
+        "pakkeboks",
+        "pickup",
+        "collect",
+        "afhentn",
+        "pakkehop",
+        "shop",
     ]
-    
+
     store_pickup_keywords: List[str] = [
-        'butik', 'store', 'afhent i butik', 'collect in store',
-        'click and collect', 'hent i butik', 'butikken', 'matas butik'
+        "butik",
+        "store",
+        "afhent i butik",
+        "collect in store",
+        "click and collect",
+        "hent i butik",
+        "butikken",
+        "matas butik",
     ]
-    
+
     parcel_locker_keywords: List[str] = [
-        'pakkeboks', 'parcel locker', 'locker', 'automat',
-        'boks', 'swipbox', 'pakkebox'
+        "pakkeboks",
+        "parcel locker",
+        "locker",
+        "automat",
+        "boks",
+        "swipbox",
+        "pakkebox",
     ]
-    
+
     # Shipping Price Patterns (regex)
     shipping_price_patterns: List[str] = [
-        r'\d+\s*kr',
-        r'kr\s*\d+',
-        r'\d+\s*DKK',
-        r'gratis',
-        r'free',
+        r"\d+\s*kr",
+        r"kr\s*\d+",
+        r"\d+\s*DKK",
+        r"gratis",
+        r"free",
     ]
-    
+
     # Expand/Show More Button Selectors (for shipping sections)
     expand_selectors: List[str] = [
         'button:has-text("Vis mere")',
@@ -369,23 +429,38 @@ class Settings(BaseSettings):
         'button:has-text("Show more")',
         'button:has-text("Expand")',
         'button:has-text("View more")',
-        'summary',
+        "summary",
         'button[aria-expanded="false"]',
     ]
-    
+
     # Non-Product URL Patterns
     non_product_patterns: List[str] = [
-        '/blog/', '/article/', '/news/', '/story/', '/stories/',
-        '/category/', '/categories/', '/collection/', '/collections/',
-        '/guide/', '/guides/', '/tips/', '/advice/',
-        '/campaign/', '/campaigns/', '/promotion/', '/promotions/',
-        '/inspiration/', '/editorial/', '/magazine/'
+        "/blog/",
+        "/article/",
+        "/news/",
+        "/story/",
+        "/stories/",
+        "/category/",
+        "/categories/",
+        "/collection/",
+        "/collections/",
+        "/guide/",
+        "/guides/",
+        "/tips/",
+        "/advice/",
+        "/campaign/",
+        "/campaigns/",
+        "/promotion/",
+        "/promotions/",
+        "/inspiration/",
+        "/editorial/",
+        "/magazine/",
     ]
-    
+
     # Default Values
     default_currency: str = "USD"
     default_availability: str = "in stock"
-    
+
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -393,4 +468,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-

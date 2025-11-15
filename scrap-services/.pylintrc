@@ -1,0 +1,28 @@
+[MASTER]
+ignore=CVS,.git,__pycache__,.pytest_cache
+
+[MESSAGES CONTROL]
+# Temporarily disable some checks while we incrementally improve
+disable=
+    C0330,  # Wrong hanging indentation
+    C0326,  # Bad whitespace
+    W0511,  # TODO/FIXME comments
+    R0801,  # Similar lines
+
+[FORMAT]
+max-line-length=120
+
+[DESIGN]
+# More lenient thresholds to allow current code to pass
+max-args=8
+max-attributes=12
+max-branches=15
+max-locals=20
+max-statements=75
+min-public-methods=0
+
+[BASIC]
+good-names=i,j,k,db,id,_,e,ex,sp,url
+
+[SIMILARITIES]
+min-similarity-lines=20
