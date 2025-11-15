@@ -1,7 +1,6 @@
 """Main application entry point.
 
-This demonstrates the concurrent architecture that is Kafka-ready.
-All services communicate via Pydantic schemas that can be serialized to Kafka.
+All services communicate via Pydantic schemas that can be serialized to Kafka, when required.
 """
 import asyncio
 import sys
@@ -19,7 +18,7 @@ from src.schemas.messages import AnalysisResult, ScrapedProduct, ProcessedProduc
 
 async def scrape_url_async(url: str, product_path: str = None, checkout_path: str = None):
     """
-    Scrape pipeline demonstrating Kafka-ready architecture.
+    Scrape pipeline for scraping a url.
 
     Pipeline Flow (Current):
         URL → Analyzer → AnalysisResult → Scraper → ScrapedProduct → ETL → ProcessedProduct
@@ -47,7 +46,6 @@ async def scrape_url_async(url: str, product_path: str = None, checkout_path: st
 
     try:
         # STEP 1: Website Analysis (Analyzer Service)
-        # Future: This publishes AnalysisResult to 'analysis-results' Kafka topic
         logger.info("=" * 70)
         logger.info("STEP 1: Website Analysis & Product Discovery")
         logger.info("=" * 70)

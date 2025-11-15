@@ -1,7 +1,7 @@
 """
 Website Analyzer Service
 Analyzes websites for scraping readiness using Playwright async API
-Returns AnalysisResult Pydantic schema (Kafka-ready)
+Returns AnalysisResult Pydantic schema
 """
 import logging
 import random
@@ -23,7 +23,7 @@ class AnalyzerService:
         self.playwright = None
         self.browser = None
         self.timeout = timeout or settings.page_timeout
-        self.headless = headless
+        self.headless = settings.headless_mode if headless is None else headless
 
     async def __aenter__(self):
         await self.start()
@@ -286,7 +286,7 @@ class AnalyzerService:
 
     async def discover_product_url(self, url: str, max_retries: int = 2) -> Optional[str]:
         """
-        Discover a product URL from the homepage with improved speed and reliability.
+        Discover a product URL from the homepage.
         Uses intelligent filtering, scoring, and validation.
 
         Args:
