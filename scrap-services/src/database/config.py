@@ -15,16 +15,12 @@ async_engine = create_async_engine(
     pool_pre_ping=True,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_max_overflow,
-    echo=False
+    echo=False,
 )
 
 # Async session factory
 AsyncSessionLocal = async_sessionmaker(
-    async_engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False
+    async_engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
 )
 
 # Base class for models

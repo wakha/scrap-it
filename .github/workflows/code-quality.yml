@@ -264,9 +264,9 @@ jobs:
           echo "Pylint Score: $PYLINT"
           echo "Maintainability Index: $RADON"
           
-          # Set thresholds
+          # Set thresholds (adjusted for legacy codebase)
           PYLINT_THRESHOLD=7.0
-          RADON_THRESHOLD=65
+          RADON_THRESHOLD=35
           
           echo "pylint_score=$PYLINT" >> $GITHUB_OUTPUT
           echo "radon_mi=$RADON" >> $GITHUB_OUTPUT

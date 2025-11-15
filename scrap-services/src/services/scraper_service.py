@@ -21,14 +21,8 @@ logger = logging.getLogger(__name__)
 
 class ScraperService:
     """Service for product scraping using Playwright with retry and fallback mechanisms"""
-    
-    def __init__(
-        self,
-        headless: bool = True,
-        screenshot: bool = False,
-        max_retries: int = None,
-        timeout: int = None
-    ):
+
+    def __init__(self, headless: bool = True, screenshot: bool = False, max_retries: int = None, timeout: int = None):
         self.headless = headless
         self.screenshot = screenshot
         self.max_retries = max_retries or settings.max_retries
@@ -36,25 +30,25 @@ class ScraperService:
         self.playwright = None
         self.browser = None
         self.data_extractor = DataExtractor()
-        
+
         # Create screenshots directory if needed
         if self.screenshot:
             screenshots_dir = Path("screenshots")
             screenshots_dir.mkdir(parents=True, exist_ok=True)
-    
+
     async def __aenter__(self):
         await self.start()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
-    
+
     async def start(self):
         """Start Playwright and browser."""
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(headless=self.headless)
         logger.info(" Browser started")
-    
+
     async def close(self):
         """Close browser and Playwright."""
         if self.browser:
@@ -62,14 +56,14 @@ class ScraperService:
         if self.playwright:
             await self.playwright.stop()
         logger.info(" Browser closed")
-    
+
     async def scrape(self, analysis: AnalysisResult) -> Optional[ScrapedProduct]:
         """
         Scrape a single product based on AnalysisResult with retry logic.
-        
+
         Args:
             analysis: AnalysisResult Pydantic schema from analyzer
-            
+
         Returns:
             ScrapedProduct Pydantic schema (or None on failure)
         """
@@ -77,21 +71,21 @@ class ScraperService:
         source_website = analysis.source_website
         selectors = analysis.selectors
         delay = analysis.scrape_delay
-        
+
         logger.info(f" Starting scrape for {source_website}")
         logger.info(f"[URL] {product_url}")
-        
+
         # Retry loop with exponential backoff
         for attempt in range(self.max_retries):
             try:
                 # Ensure browser is started
                 if not self.browser:
                     await self.start()
-                
+
                 # Create new page with timeout
                 page = await self.browser.new_page()
                 page.set_default_timeout(self.timeout)
-                
+
                 # Navigate to product page with retry
                 logger.info(f"Loading page... (Attempt {attempt + 1}/{self.max_retries})")
                 try:
@@ -100,21 +94,21 @@ class ScraperService:
                     logger.warning(f"Page load timeout on attempt {attempt + 1}")
                     await page.close()
                     if attempt < self.max_retries - 1:
-                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
                         logger.info(f"Retrying in {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
                     else:
                         logger.error("Max retries reached for page load")
                         return None
-                
+
                 # Wait for dynamic content
                 logger.info(f"Waiting {settings.dynamic_content_wait}s for dynamic content...")
                 await asyncio.sleep(settings.dynamic_content_wait)
-                
+
                 # Handle cookie consent banners that might hide add-to-cart buttons
                 logger.info("[COOKIE] Checking for and dismissing cookie consent banners...")
-                
+
                 cookie_dismissed = False
                 for cookie_sel in settings.cookie_selectors:
                     try:
@@ -129,33 +123,33 @@ class ScraperService:
                     except Exception as e:
                         logger.debug(f"[COOKIE] Failed to click {cookie_sel}: {e}")
                         continue
-                
+
                 if not cookie_dismissed:
                     logger.debug("[COOKIE] No cookie banner found or already dismissed")
-                
+
                 # Store cookie dismissal state for later use
                 self._cookie_dismissed = cookie_dismissed
-                
+
                 # Extract product information
                 logger.info("Extracting product data...")
-                
+
                 # Get page content
                 html_content = await page.content()
-                soup = BeautifulSoup(html_content, 'html.parser')
-                
+                soup = BeautifulSoup(html_content, "html.parser")
+
                 # Extract with fallback mechanisms
                 title = await self._extract_title(soup, page)
                 price, currency = await self._extract_price(soup, page)
                 description = await self._extract_description(soup)
                 image_url = await self._extract_image(soup)
-                
+
                 # Try to extract shipping from cart/checkout (more accurate)
                 shipping_providers = await self._extract_shipping_from_cart(page, soup)
-                
+
                 # If cart extraction fails/not supported, fall back to page extraction
                 if not shipping_providers:
                     shipping_providers = await self._extract_shipping_providers(soup)
-                
+
                 if not title:
                     logger.error("Failed to extract product title - critical field missing")
                     await page.close()
@@ -163,7 +157,7 @@ class ScraperService:
                         logger.info("Retrying extraction...")
                         continue
                     return None
-                
+
                 # Take screenshot if enabled
                 screenshot_path = None
                 if self.screenshot:
@@ -174,9 +168,9 @@ class ScraperService:
                     except Exception as e:
                         logger.warning(f"Failed to save screenshot: {e}")
                         # Continue even if screenshot fails
-                
+
                 await page.close()
-                
+
                 # Create ScrapedProduct schema
                 scraped_product = ScrapedProduct(
                     title=title,
@@ -193,177 +187,222 @@ class ScraperService:
                         "image_url": image_url,
                         "description": description,
                         "availability": "in stock",
-                        "extraction_attempt": attempt + 1
-                    }
+                        "extraction_attempt": attempt + 1,
+                    },
                 )
-                
+
                 logger.info(f" Successfully scraped: {scraped_product.title}")
-                
+
                 # Future: Publish to Kafka topic 'scraped-products'
                 # await kafka_producer.send('scraped-products', scraped_product.model_dump_json())
-                
+
                 return scraped_product
-            
+
             except Exception as e:
                 logger.error(f"Error during scraping (attempt {attempt + 1}/{self.max_retries}): {e}")
                 logger.debug(f"Stack trace: {traceback.format_exc()}")
-                
+
                 if attempt < self.max_retries - 1:
-                    wait_time = 2 ** attempt
+                    wait_time = 2**attempt
                     logger.info(f"Retrying in {wait_time}s...")
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error("Max retries reached, scraping failed")
                     return None
-        
+
         return None
-    
+
     async def _extract_title(self, soup: BeautifulSoup, page) -> Optional[str]:
-        """Extract title with multiple fallback strategies"""
+        """
+        Extract product title using multiple fallback strategies.
+
+        Tries in order:
+        1. h1 tag (most common for product pages)
+        2. Elements with 'product' and 'title' in class name
+        3. Open Graph meta title (og:title)
+        4. h2 tag as last resort
+
+        Args:
+            soup: BeautifulSoup parsed HTML of product page
+            page: Playwright page object for dynamic content
+
+        Returns:
+            Product title string or None if extraction fails
+        """
         try:
             # Strategy 1: h1 tag
-            title_elem = soup.find('h1')
+            title_elem = soup.find("h1")
             if title_elem:
                 title = title_elem.get_text(strip=True)
                 if title:
                     return title
-            
+
             # Strategy 2: Product title class
-            title_elem = soup.find(class_=lambda x: x and 'product' in x.lower() and 'title' in x.lower() if x else False)
+            title_elem = soup.find(
+                class_=lambda x: x and "product" in x.lower() and "title" in x.lower() if x else False
+            )
             if title_elem:
                 title = title_elem.get_text(strip=True)
                 if title:
                     logger.info("Used fallback: product title class")
                     return title
-            
+
             # Strategy 3: Page title meta tag
-            meta_title = soup.find('meta', property='og:title')
-            if meta_title and meta_title.get('content'):
+            meta_title = soup.find("meta", property="og:title")
+            if meta_title and meta_title.get("content"):
                 logger.info("Used fallback: meta og:title")
-                return meta_title.get('content')
-            
+                return meta_title.get("content")
+
             # Strategy 4: h2 as last resort
-            title_elem = soup.find('h2')
+            title_elem = soup.find("h2")
             if title_elem:
                 title = title_elem.get_text(strip=True)
                 if title:
                     logger.warning("Used fallback: h2 tag (low confidence)")
                     return title
-            
+
             return None
         except Exception as e:
             logger.error(f"Error extracting title: {e}")
             return None
-    
+
     async def _extract_price(self, soup: BeautifulSoup, page) -> tuple[Optional[float], Optional[str]]:
-        """Extract price with multiple fallback strategies"""
+        """
+        Extract product price and currency using multiple fallback strategies.
+
+        Tries in order:
+        1. WooCommerce-specific price elements
+        2. Elements with 'price' in class name
+        3. Schema.org structured data (JSON-LD)
+        4. Open Graph meta tags
+
+        Args:
+            soup: BeautifulSoup parsed HTML of product page
+            page: Playwright page object
+
+        Returns:
+            Tuple of (price_float, currency_code) or (None, None) if not found
+        """
         try:
             # Strategy 1: WooCommerce specific price elements
-            price_elem = soup.select_one('.woocommerce-Price-amount.amount, .price ins .amount, .price .amount')
+            price_elem = soup.select_one(".woocommerce-Price-amount.amount, .price ins .amount, .price .amount")
             if price_elem:
                 price_text = price_elem.get_text(strip=True)
                 price_tuple = self.data_extractor.extract_price_with_regex(price_text)
                 if price_tuple:
                     logger.info("Used WooCommerce price selector")
                     return price_tuple
-            
+
             # Strategy 2: WooCommerce variation price (often in select options or table)
-            variation_prices = soup.select('.variations select option, .variations td')
+            variation_prices = soup.select(".variations select option, .variations td")
             for elem in variation_prices:
                 text = elem.get_text(strip=True)
                 # Look for price in format "23kr V/144 stk." or similar
-                if 'kr' in text.lower() and 'v/' in text.lower():
+                if "kr" in text.lower() and "v/" in text.lower():
                     # Extract the first price (which is usually the unit price)
-                    price_tuple = self.data_extractor.extract_price_with_regex(text.split('V/')[0])
+                    price_tuple = self.data_extractor.extract_price_with_regex(text.split("V/")[0])
                     if price_tuple:
                         logger.info(f"Used WooCommerce variation price from: {text[:50]}")
                         return price_tuple
-            
+
             # Strategy 3: Price class (general)
-            price_elem = soup.find(class_=lambda x: x and 'price' in x.lower() if x else False)
+            price_elem = soup.find(class_=lambda x: x and "price" in x.lower() if x else False)
             if price_elem:
                 price_text = price_elem.get_text(strip=True)
                 price_tuple = self.data_extractor.extract_price_with_regex(price_text)
                 if price_tuple:
                     return price_tuple
-            
+
             # Strategy 4: itemprop price
-            price_elem = soup.find(attrs={'itemprop': 'price'})
+            price_elem = soup.find(attrs={"itemprop": "price"})
             if price_elem:
-                price_text = price_elem.get_text(strip=True) or price_elem.get('content', '')
+                price_text = price_elem.get_text(strip=True) or price_elem.get("content", "")
                 price_tuple = self.data_extractor.extract_price_with_regex(price_text)
                 if price_tuple:
                     logger.info("Used fallback: itemprop price")
                     return price_tuple
-            
+
             # Strategy 5: meta og:price
-            meta_price = soup.find('meta', property='og:price:amount')
-            if meta_price and meta_price.get('content'):
+            meta_price = soup.find("meta", property="og:price:amount")
+            if meta_price and meta_price.get("content"):
                 try:
-                    price = float(meta_price.get('content'))
-                    currency_meta = soup.find('meta', property='og:price:currency')
-                    currency = currency_meta.get('content') if currency_meta else 'USD'
+                    price = float(meta_price.get("content"))
+                    currency_meta = soup.find("meta", property="og:price:currency")
+                    currency = currency_meta.get("content") if currency_meta else "USD"
                     logger.info("Used fallback: meta og:price")
                     return price, currency
                 except ValueError:
                     pass
-            
+
             logger.warning("Could not extract price with any strategy")
             return None, None
         except Exception as e:
             logger.error(f"Error extracting price: {e}")
             return None, None
-    
+
     async def _extract_description(self, soup: BeautifulSoup) -> Optional[str]:
-        """Extract description with fallback"""
+        """
+        Extract product description using fallback strategies.
+
+        Tries in order:
+        1. Elements with 'product_description' class
+        2. Meta description tag
+        3. First paragraph element as fallback
+
+        Args:
+            soup: BeautifulSoup parsed HTML of product page
+
+        Returns:
+            Product description text or None
+        """
         try:
             # Strategy 1: product_description class
-            desc_elem = soup.find(class_='product_description')
+            desc_elem = soup.find(class_="product_description")
             if desc_elem:
                 return desc_elem.get_text(strip=True)
-            
+
             # Strategy 2: meta description
-            meta_desc = soup.find('meta', attrs={'name': 'description'})
-            if meta_desc and meta_desc.get('content'):
-                return meta_desc.get('content')
-            
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            if meta_desc and meta_desc.get("content"):
+                return meta_desc.get("content")
+
             # Strategy 3: first paragraph
-            p_elem = soup.find('p')
+            p_elem = soup.find("p")
             if p_elem:
                 logger.info("Used fallback: first paragraph for description")
                 return p_elem.get_text(strip=True)
-            
+
             return None
         except Exception as e:
             logger.warning(f"Error extracting description: {e}")
             return None
-    
+
     async def _extract_image(self, soup: BeautifulSoup) -> Optional[str]:
         """Extract image URL with fallback"""
         try:
             # Strategy 1: img tag
-            img_elem = soup.find('img')
+            img_elem = soup.find("img")
             if img_elem:
-                return img_elem.get('src')
-            
+                return img_elem.get("src")
+
             # Strategy 2: meta og:image
-            meta_img = soup.find('meta', property='og:image')
-            if meta_img and meta_img.get('content'):
+            meta_img = soup.find("meta", property="og:image")
+            if meta_img and meta_img.get("content"):
                 logger.info("Used fallback: meta og:image")
-                return meta_img.get('content')
-            
+                return meta_img.get("content")
+
             return None
         except Exception as e:
             logger.warning(f"Error extracting image: {e}")
             return None
-    
+
     def _classify_delivery_type(self, text: str) -> str:
         """
         Classify the delivery type based on text content.
-        
+
         Args:
             text: Shipping option text (already lowercased)
-            
+
         Returns:
             Delivery type: "home_delivery", "store_pickup", "parcel_shop", or "parcel_locker"
         """
@@ -379,7 +418,7 @@ class ScraperService:
         else:
             # Default to home delivery if unclear
             return "home_delivery"
-    
+
     async def _expand_shipping_sections(self, page) -> None:
         """
         Try to expand any collapsed shipping sections or cards that might hide shipping details.
@@ -388,7 +427,7 @@ class ScraperService:
         """
         try:
             logger.info("[CHECKOUT] Checking for expandable shipping sections...")
-            
+
             # Common selectors for expand/show buttons in shipping sections
             # Exclude navigation buttons like "Next", "Continue", "Proceed to payment"
             expanded_count = 0
@@ -401,19 +440,40 @@ class ScraperService:
                             if is_visible:
                                 text = await element.text_content() or ""
                                 text_lower = text.lower()
-                                
+
                                 # Skip if this looks like a navigation button
                                 navigation_keywords = [
-                                    'næste', 'next', 'fortsæt', 'continue', 'proceed',
-                                    'betaling', 'payment', 'checkout', 'til betaling',
-                                    'gå til', 'go to', 'submit', 'send'
+                                    "næste",
+                                    "next",
+                                    "fortsæt",
+                                    "continue",
+                                    "proceed",
+                                    "betaling",
+                                    "payment",
+                                    "checkout",
+                                    "til betaling",
+                                    "gå til",
+                                    "go to",
+                                    "submit",
+                                    "send",
                                 ]
                                 if any(keyword in text_lower for keyword in navigation_keywords):
                                     logger.debug(f"[CHECKOUT] Skipping navigation button: {text[:50]}")
                                     continue
-                                
+
                                 # Only click if it's related to shipping/delivery or is a details/summary
-                                if any(keyword in text_lower for keyword in ['levering', 'shipping', 'delivery', 'forsendelse', 'vis', 'show', 'se']):
+                                if any(
+                                    keyword in text_lower
+                                    for keyword in [
+                                        "levering",
+                                        "shipping",
+                                        "delivery",
+                                        "forsendelse",
+                                        "vis",
+                                        "show",
+                                        "se",
+                                    ]
+                                ):
                                     await element.click()
                                     expanded_count += 1
                                     logger.info(f"[CHECKOUT] Expanded section: {text[:50]}")
@@ -421,15 +481,15 @@ class ScraperService:
                             logger.debug(f"[CHECKOUT] Failed to click expand element: {e}")
                 except Exception:
                     continue
-            
+
             if expanded_count > 0:
                 logger.info(f"[CHECKOUT] Expanded {expanded_count} shipping sections")
             else:
                 logger.info("[CHECKOUT] No expandable sections found or all already expanded")
-                
+
         except Exception as e:
             logger.debug(f"[CHECKOUT] Error expanding shipping sections: {e}")
-    
+
     async def _fill_checkout_details_if_needed(self, page) -> None:
         """
         Fill in required checkout details (email, name, address) and progress through checkout steps.
@@ -438,42 +498,46 @@ class ScraperService:
         """
         try:
             logger.info("[CHECKOUT] Starting multi-step checkout process...")
-            
+
             # Test data for checkout forms (from config)
             test_data = {
-                'email': settings.test_email,
-                'first_name': settings.test_first_name,
-                'last_name': settings.test_last_name,
-                'phone': settings.test_phone,
-                'address': settings.test_address,
-                'postal_code': settings.test_postal_code,
-                'city': settings.test_city,
-                'country': settings.test_country,
-                'first_and_last_name': f"{settings.test_first_name} {settings.test_last_name}"
+                "email": settings.test_email,
+                "first_name": settings.test_first_name,
+                "last_name": settings.test_last_name,
+                "phone": settings.test_phone,
+                "address": settings.test_address,
+                "postal_code": settings.test_postal_code,
+                "city": settings.test_city,
+                "country": settings.test_country,
+                "first_and_last_name": f"{settings.test_first_name} {settings.test_last_name}",
             }
-            
+
             # Try up to max checkout steps (most checkouts have 2-3 steps)
             max_steps = settings.max_checkout_steps
             for step in range(max_steps):
                 logger.info(f"[CHECKOUT] Processing step {step + 1}/{max_steps}...")
-                
+
                 # Debug: Log all visible input fields on the page
                 try:
-                    all_inputs = await page.query_selector_all('input[type="text"], input[type="email"], input[type="tel"]')
+                    all_inputs = await page.query_selector_all(
+                        'input[type="text"], input[type="email"], input[type="tel"]'
+                    )
                     logger.info(f"[CHECKOUT] Found {len(all_inputs)} text/email/tel input fields on page")
                     for idx, inp in enumerate(all_inputs[:10]):  # Log first 10 only
                         is_vis = await inp.is_visible()
                         if is_vis:
-                            name = await inp.get_attribute('name')
-                            placeholder = await inp.get_attribute('placeholder')
-                            input_id = await inp.get_attribute('id')
-                            logger.info(f"[CHECKOUT] Input {idx}: name='{name}', id='{input_id}', placeholder='{placeholder}'")
+                            name = await inp.get_attribute("name")
+                            placeholder = await inp.get_attribute("placeholder")
+                            input_id = await inp.get_attribute("id")
+                            logger.info(
+                                f"[CHECKOUT] Input {idx}: name='{name}', id='{input_id}', placeholder='{placeholder}'"
+                            )
                 except Exception as e:
                     logger.debug(f"[CHECKOUT] Error logging inputs: {e}")
-                
+
                 # Fill visible form fields FIRST
                 fields_filled = 0
-                
+
                 # Try to fill combined first and last name field (for matas.dk)
                 for selector in settings.combined_name_selectors:
                     try:
@@ -481,13 +545,13 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['first_and_last_name'])
+                                await field.fill(test_data["first_and_last_name"])
                                 logger.info(f"[CHECKOUT] Filled combined name field: {selector}")
                                 fields_filled += 1
                             break
                     except Exception as e:
                         logger.debug(f"[CHECKOUT] Combined name selector {selector} failed: {e}")
-                
+
                 # Try to fill email field
                 for selector in settings.email_selectors:
                     try:
@@ -495,13 +559,13 @@ class ScraperService:
                         if email_field and await email_field.is_visible():
                             current_value = await email_field.input_value()
                             if not current_value:
-                                await email_field.fill(test_data['email'])
+                                await email_field.fill(test_data["email"])
                                 logger.info(f"[CHECKOUT] Filled email: {selector}")
                                 fields_filled += 1
                             break
                     except Exception as e:
                         logger.debug(f"[CHECKOUT] Email selector {selector} failed: {e}")
-                
+
                 # Try to fill first name
                 for selector in settings.first_name_selectors:
                     try:
@@ -509,13 +573,13 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['first_name'])
+                                await field.fill(test_data["first_name"])
                                 logger.info(f"[CHECKOUT] Filled first name: {selector}")
                                 fields_filled += 1
                             break
                     except Exception:
                         pass
-                
+
                 # Try to fill last name
                 for selector in settings.last_name_selectors:
                     try:
@@ -523,13 +587,13 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['last_name'])
+                                await field.fill(test_data["last_name"])
                                 logger.info(f"[CHECKOUT] Filled last name: {selector}")
                                 fields_filled += 1
                             break
                     except Exception:
                         pass
-                
+
                 # Try to fill phone
                 for selector in settings.phone_selectors:
                     try:
@@ -537,13 +601,13 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['phone'])
+                                await field.fill(test_data["phone"])
                                 logger.info(f"[CHECKOUT] Filled phone: {selector}")
                                 fields_filled += 1
                             break
                     except Exception:
                         pass
-                
+
                 # Try to fill address
                 for selector in settings.address_selectors:
                     try:
@@ -551,13 +615,13 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['address'])
+                                await field.fill(test_data["address"])
                                 logger.info(f"[CHECKOUT] Filled address: {selector}")
                                 fields_filled += 1
                             break
                     except Exception:
                         pass
-                
+
                 # Try to fill postal code
                 for selector in settings.postal_code_selectors:
                     try:
@@ -565,13 +629,13 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['postal_code'])
+                                await field.fill(test_data["postal_code"])
                                 logger.info(f"[CHECKOUT] Filled postal code: {selector}")
                                 fields_filled += 1
                             break
                     except Exception:
                         pass
-                
+
                 # Try to fill city
                 for selector in settings.city_selectors:
                     try:
@@ -579,15 +643,15 @@ class ScraperService:
                         if field and await field.is_visible():
                             current_value = await field.input_value()
                             if not current_value:
-                                await field.fill(test_data['city'])
+                                await field.fill(test_data["city"])
                                 logger.info(f"[CHECKOUT] Filled city: {selector}")
                                 fields_filled += 1
                             break
                     except Exception:
                         pass
-                
+
                 logger.info(f"[CHECKOUT] Filled {fields_filled} fields at step {step + 1}")
-                
+
                 # Look for and click "Next", "Continue", "Næste" etc. buttons
                 next_clicked = False
                 for selector in settings.next_button_selectors:
@@ -605,16 +669,19 @@ class ScraperService:
                                 break
                     except Exception as e:
                         logger.debug(f"[CHECKOUT] Next button selector {selector} failed: {e}")
-                
+
                 if next_clicked:
                     logger.info(f"[CHECKOUT] Progressed to next checkout step")
-                    
+
                     # After clicking next, check if shipping prices are now visible
                     await asyncio.sleep(settings.page_update_wait)  # Wait for page to update
                     html = await page.content()
                     import re
-                    shipping_prices_visible = any(re.search(pattern, html.lower()) for pattern in settings.shipping_price_patterns)
-                    
+
+                    shipping_prices_visible = any(
+                        re.search(pattern, html.lower()) for pattern in settings.shipping_price_patterns
+                    )
+
                     if shipping_prices_visible:
                         logger.info(f"[CHECKOUT] Shipping prices found after clicking Next at step {step + 1}!")
                         return
@@ -623,28 +690,349 @@ class ScraperService:
                         continue  # Continue to next iteration of the loop
                 else:
                     logger.info(f"[CHECKOUT] No 'Next' button found")
-                    
+
                     # If no next button, check if shipping prices are visible on current page
                     html = await page.content()
                     import re
-                    shipping_prices_visible = any(re.search(pattern, html.lower()) for pattern in settings.shipping_price_patterns)
-                    
+
+                    shipping_prices_visible = any(
+                        re.search(pattern, html.lower()) for pattern in settings.shipping_price_patterns
+                    )
+
                     if shipping_prices_visible and fields_filled > 0:
-                        logger.info(f"[CHECKOUT] No Next button but shipping prices visible on current page after filling {fields_filled} fields!")
+                        logger.info(
+                            f"[CHECKOUT] No Next button but shipping prices visible on current page after filling {fields_filled} fields!"
+                        )
                         return
                     elif fields_filled > 0:
-                        logger.info(f"[CHECKOUT] No Next button and no shipping prices visible yet. Filled {fields_filled} fields, continuing...")
+                        logger.info(
+                            f"[CHECKOUT] No Next button and no shipping prices visible yet. Filled {fields_filled} fields, continuing..."
+                        )
                         continue
                     else:
                         # No next button and no fields filled - we're done
                         logger.info(f"[CHECKOUT] No more fields to fill or buttons to click")
                         break
-            
+
             logger.info("[CHECKOUT] Completed checkout form processing")
-            
+
         except Exception as e:
             logger.warning(f"[CHECKOUT] Error filling checkout details: {e}")
-    
+
+    async def _dismiss_cookie_banner_if_needed(self, page) -> bool:
+        """Dismiss cookie consent banner if present and not already dismissed."""
+        if hasattr(self, "_cookie_dismissed") and self._cookie_dismissed:
+            logger.info("[CART] Cookie banner already dismissed during page load, skipping...")
+            return True
+
+        logger.info("[CART] Checking for cookie consent banner...")
+        for cookie_sel in settings.cookie_selectors:
+            try:
+                cookie_btn = await page.query_selector(cookie_sel)
+                if cookie_btn:
+                    is_visible = await cookie_btn.is_visible()
+                    if is_visible:
+                        await cookie_btn.click(timeout=1000)
+                        logger.info(f"[CART] Dismissed cookie banner: {cookie_sel}")
+                        return True
+            except Exception as e:
+                logger.debug(f"[CART] Cookie selector {cookie_sel} failed: {e}")
+                continue
+
+        logger.info("[CART] No cookie banner found or already dismissed")
+        return False
+
+    async def _select_product_variant_if_needed(self, page) -> bool:
+        """Select product size/variant if required before adding to cart."""
+        logger.info("[CART] Checking for size/variant selectors...")
+        for selector in settings.variant_selectors:
+            try:
+                variant_elements = await page.query_selector_all(selector)
+                if variant_elements:
+                    logger.info(f"[CART] Found {len(variant_elements)} size options with selector: {selector}")
+                    for i, element in enumerate(variant_elements):
+                        try:
+                            is_visible = await element.is_visible()
+                            if not is_visible:
+                                logger.debug(f"[CART] Variant #{i} is hidden, skipping")
+                                continue
+
+                            tag_name = await element.evaluate("el => el.tagName.toLowerCase()")
+                            is_disabled = await element.is_disabled() if tag_name in ["button", "input"] else False
+
+                            if tag_name == "select":
+                                await element.select_option(index=1)
+                                logger.info(f"[CART] Selected variant from visible dropdown (option 1)")
+                                return True
+                            elif tag_name in ["button", "a"] and not is_disabled:
+                                await element.click()
+                                logger.info(f"[CART] Clicked visible variant {tag_name} #{i}")
+                                return True
+                            elif tag_name == "label":
+                                await element.click()
+                                logger.info(f"[CART] Clicked variant label #{i}")
+                                return True
+                            elif tag_name == "input" and not is_disabled:
+                                await element.click()
+                                logger.info(f"[CART] Clicked variant input #{i}")
+                                return True
+                        except Exception as e:
+                            logger.debug(f"[CART] Failed to select variant #{i}: {e}")
+                            continue
+                    if variant_elements:  # If we found elements, we tried to select one
+                        return True
+            except Exception as e:
+                logger.debug(f"[CART] Variant selector {selector} failed: {e}")
+                continue
+        return False
+
+    async def _find_add_to_cart_button(self, page):
+        """Find and return the add-to-cart button using multiple strategies."""
+        # Try JavaScript-based discovery first
+        logger.info("[CART] Using JavaScript to find add-to-cart button...")
+        add_to_cart_element = await page.evaluate(
+            """() => {
+            const cartTexts = ['læg i kurv', 'læg i indkøbskurven', 'tilføj til kurv', 'køb nu', 'add to cart', 'add to basket'];
+            const elements = document.querySelectorAll('a.button, a.buy-button, button, input[type="submit"]');
+            
+            for (const el of elements) {
+                const text = (el.textContent || el.value || '').toLowerCase().trim();
+                if (text.length < 100 && cartTexts.some(ct => text.includes(ct))) {
+                    return {
+                        tag: el.tagName,
+                        text: text,
+                        class: el.className,
+                        id: el.id,
+                        href: el.href || null
+                    };
+                }
+            }
+            return null;
+        }"""
+        )
+
+        cart_button = None
+        if add_to_cart_element:
+            logger.info(
+                f"[CART] JavaScript found add-to-cart: tag={add_to_cart_element['tag']}, "
+                f"text='{add_to_cart_element['text'][:50]}', class={add_to_cart_element['class']}"
+            )
+
+            try:
+                if add_to_cart_element.get("href"):
+                    selector = f"a[href='{add_to_cart_element['href']}']"
+                elif add_to_cart_element.get("class"):
+                    classes = add_to_cart_element["class"].split()
+                    if len(classes) > 1:
+                        selector = (
+                            f"a.{classes[0]}.{classes[1]}"
+                            if add_to_cart_element["tag"] == "A"
+                            else f"button.{classes[0]}.{classes[1]}"
+                        )
+                    else:
+                        selector = f"a.{classes[0]}" if add_to_cart_element["tag"] == "A" else f"button.{classes[0]}"
+                elif add_to_cart_element.get("id"):
+                    selector = f"#{add_to_cart_element['id']}"
+                else:
+                    selector = f"{add_to_cart_element['tag'].lower()}:has-text('{add_to_cart_element['text'][:15]}')"
+
+                logger.info(f"[CART] Trying JavaScript-discovered selector: {selector}")
+                cart_button = await page.query_selector(selector)
+                if cart_button and await cart_button.is_visible() and await cart_button.is_enabled():
+                    logger.info(f"[CART] Successfully found button with JS-discovered selector!")
+                    return cart_button
+            except Exception as e:
+                logger.warning(f"[CART] Failed to find button using discovered selector: {e}")
+
+        # Fallback to traditional selectors
+        for selector in settings.add_to_cart_selectors:
+            try:
+                logger.info(f"[CART] Trying selector: {selector}")
+                cart_button = await page.query_selector(selector)
+                if cart_button:
+                    is_visible = await cart_button.is_visible()
+                    is_enabled = await cart_button.is_enabled()
+                    logger.info(f"[CART] Found button with {selector}: visible={is_visible}, enabled={is_enabled}")
+
+                    if is_visible and is_enabled:
+                        logger.info(f"[CART] Using add-to-cart button: {selector}")
+                        return cart_button
+            except Exception as e:
+                logger.debug(f"[CART] Selector {selector} failed: {e}")
+                continue
+
+        return None
+
+    async def _click_add_to_cart_and_validate(self, page, cart_button) -> bool:
+        """Click the add-to-cart button and validate the cart was updated."""
+        try:
+            url_before = page.url
+
+            # Click without waiting for navigation
+            try:
+                await cart_button.click(timeout=5000, no_wait_after=True)
+                logger.info("[CART] Clicked add-to-cart button")
+            except Exception as click_error:
+                logger.warning(f"[CART] Normal click failed: {click_error}, trying force click...")
+                await cart_button.click(force=True, no_wait_after=True)
+                logger.info("[CART] Force-clicked add-to-cart button")
+
+            # Wait for cart to update
+            await asyncio.sleep(settings.cart_modal_wait)
+
+            # Validate using JavaScript
+            cart_state = await page.evaluate(
+                """() => {
+                const indicators = {
+                    cartCountElement: null,
+                    cartCountValue: null,
+                    cartModal: null,
+                    checkoutButton: null
+                };
+                
+                const countSelectors = ['[class*="cart-count"]', '[class*="cart-badge"]', '[class*="cart-quantity"]', '[class*="CartBadge"]', '[data-test*="cart-count"]'];
+                for (const sel of countSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        indicators.cartCountElement = sel;
+                        indicators.cartCountValue = el.textContent || el.innerText;
+                        break;
+                    }
+                }
+                
+                const modalSelectors = ['[class*="cart-modal"]', '[class*="CartModal"]', '[class*="mini-cart"]', '[class*="MiniCart"]', '[class*="cart-drawer"]'];
+                for (const sel of modalSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && (el.offsetParent !== null || window.getComputedStyle(el).display !== 'none')) {
+                        indicators.cartModal = sel;
+                        break;
+                    }
+                }
+                
+                const checkoutTexts = ['se kurv', 'gå til kurv', 'view cart', 'checkout', 'til kassen'];
+                for (const text of checkoutTexts) {
+                    const buttons = Array.from(document.querySelectorAll('button, a'));
+                    const btn = buttons.find(b => b.textContent.toLowerCase().includes(text) && (b.offsetParent !== null));
+                    if (btn) {
+                        indicators.checkoutButton = text;
+                        break;
+                    }
+                }
+                
+                return indicators;
+            }"""
+            )
+
+            # Check JS indicators
+            if cart_state:
+                if cart_state.get("cartCountValue") and cart_state["cartCountValue"].strip() not in ["0", ""]:
+                    logger.info(f"[CART] Validation passed (JS): Cart count shows {cart_state['cartCountValue']}")
+                    return True
+                elif cart_state.get("cartModal"):
+                    logger.info(f"[CART] Validation passed (JS): Cart modal visible: {cart_state['cartModal']}")
+                    return True
+                elif cart_state.get("checkoutButton"):
+                    logger.info(f"[CART] Validation passed (JS): Checkout button found: {cart_state['checkoutButton']}")
+                    return True
+
+            # Check URL change
+            url_after = page.url
+            if url_after != url_before:
+                if any(
+                    keyword in url_after.lower() for keyword in ["/cart", "/kurv", "/kassen", "/checkout", "/basket"]
+                ):
+                    logger.info(f"[CART] Validation passed: URL changed to cart/checkout: {url_after}")
+                    return True
+
+            # Check cart indicators
+            for indicator in settings.cart_indicator_selectors:
+                try:
+                    element = await page.query_selector(indicator)
+                    if element and await element.is_visible():
+                        logger.info(f"[CART] Validation passed: Found cart indicator: {indicator}")
+                        return True
+                except Exception:
+                    continue
+
+            # Check cart quantity
+            for indicator in settings.cart_quantity_selectors:
+                try:
+                    element = await page.query_selector(indicator)
+                    if element:
+                        text = await element.inner_text()
+                        if text and text.strip() and text.strip() != "0":
+                            logger.info(f"[CART] Validation passed: Cart quantity shows: {text}")
+                            return True
+                except Exception:
+                    continue
+
+            # Retry validation
+            logger.warning("[CART] Failed initial validation - retrying...")
+            await asyncio.sleep(settings.validation_retry_wait)
+            for indicator in settings.cart_indicator_selectors:
+                try:
+                    element = await page.query_selector(indicator)
+                    if element and await element.is_visible():
+                        logger.info(f"[CART] Validation passed (retry): Found cart indicator: {indicator}")
+                        return True
+                except Exception:
+                    continue
+
+            logger.warning("[CART] Cart validation failed - cart might be empty")
+            return False
+
+        except Exception as e:
+            logger.warning(f"[CART] Failed to click add-to-cart: {e}")
+            return False
+
+    async def _navigate_to_checkout_page(self, page) -> bool:
+        """Navigate directly to checkout page."""
+        try:
+            current_url = page.url
+            from urllib.parse import urlparse, urljoin
+
+            parsed = urlparse(current_url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+            checkout_urls = [
+                urljoin(base_url, "/checkout"),
+                urljoin(base_url, "/kassen"),
+                urljoin(base_url, "/levering"),
+            ]
+
+            for checkout_url in checkout_urls:
+                try:
+                    logger.info(f"[CART] Attempting to navigate directly to: {checkout_url}")
+                    await page.goto(checkout_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout)
+                    await asyncio.sleep(settings.page_update_wait)
+                    current = page.url.lower()
+                    if any(keyword in current for keyword in ["/checkout", "/kassen", "/levering"]):
+                        logger.info(f"[CART] Successfully navigated to checkout: {page.url}")
+                        return True
+                except Exception as nav_error:
+                    logger.debug(f"[CART] Failed to navigate to {checkout_url}: {nav_error}")
+                    continue
+
+            # Try cart URLs
+            cart_urls = [urljoin(base_url, "/cart"), urljoin(base_url, "/kurv")]
+            for cart_url in cart_urls:
+                try:
+                    logger.info(f"[CART] Attempting to navigate to cart: {cart_url}")
+                    await page.goto(cart_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout)
+                    await asyncio.sleep(settings.page_update_wait)
+                    current = page.url.lower()
+                    if any(keyword in current for keyword in ["/cart", "/kurv"]):
+                        logger.info(f"[CART] Successfully navigated to cart: {page.url}")
+                        return True
+                except Exception as nav_error:
+                    logger.debug(f"[CART] Failed to navigate to {cart_url}: {nav_error}")
+                    continue
+
+            return False
+        except Exception as e:
+            logger.warning(f"[CART] Failed to navigate to checkout: {e}")
+            return False
+
     async def _extract_shipping_from_cart(self, page, soup: BeautifulSoup) -> List[ShippingProvider]:
         """
         Extract shipping information by adding product to cart and checking checkout.
@@ -654,410 +1042,31 @@ class ScraperService:
         providers = []
         try:
             logger.info("[CART] Attempting to extract shipping from cart/checkout...")
-            
-            # Dismiss cookie consent banner first (might be blocking add-to-cart button)
-            # Skip if already dismissed during page load to save time
-            if hasattr(self, '_cookie_dismissed') and self._cookie_dismissed:
-                logger.info("[CART] Cookie banner already dismissed during page load, skipping...")
-                cookie_dismissed = True
-            else:
-                logger.info("[CART] Checking for cookie consent banner...")
-                
-                cookie_dismissed = False
-                for cookie_sel in settings.cookie_selectors:
-                    try:
-                        cookie_btn = await page.query_selector(cookie_sel)
-                        if cookie_btn:
-                            is_visible = await cookie_btn.is_visible()
-                            if is_visible:
-                                # Reduced timeout since banner should appear quickly if present
-                                await cookie_btn.click(timeout=1000)
-                                logger.info(f"[CART] Dismissed cookie banner: {cookie_sel}")
-                                cookie_dismissed = True
-                                break
-                    except Exception as e:
-                        logger.debug(f"[CART] Cookie selector {cookie_sel} failed: {e}")
-                        continue
-            
-            if not cookie_dismissed:
-                logger.info("[CART] No cookie banner found or already dismissed")
-            
-            # First, check if we need to select a size/variant before adding to cart
-            # Check for forms (some sites use form submission)
-            all_forms = await page.query_selector_all('form')
-            logger.info(f"[CART] Found {len(all_forms)} forms on page")
-            for i, form in enumerate(all_forms[:5]):
-                try:
-                    action = await form.get_attribute('action')
-                    form_id = await form.get_attribute('id')
-                    form_class = await form.get_attribute('class')
-                    logger.info(f"[CART] Form {i}: id='{form_id}', class='{form_class}', action='{action}'")
-                except Exception as e:
-                    logger.debug(f"[CART] Could not analyze form {i}: {e}")
-            
-            # Check for submit/input buttons
-            all_inputs = await page.query_selector_all('input[type="submit"], input[type="button"]')
-            logger.info(f"[CART] Found {len(all_inputs)} input buttons")
-            for i, inp in enumerate(all_inputs[:10]):
-                try:
-                    value = await inp.get_attribute('value')
-                    input_id = await inp.get_attribute('id')
-                    input_class = await inp.get_attribute('class')
-                    is_visible = await inp.is_visible()
-                    logger.info(f"[CART] Input {i}: value='{value}', id='{input_id}', class='{input_class}', visible={is_visible}")
-                except Exception as e:
-                    logger.debug(f"[CART] Could not analyze input {i}: {e}")
-            
-            # Check regular buttons with more detail
-            all_buttons = await page.query_selector_all('button')
-            logger.info(f"[CART] Found {len(all_buttons)} total buttons on page")
-            for i, btn in enumerate(all_buttons[:30]):  # Check more buttons
-                try:
-                    text = await btn.inner_text()
-                    classes = await btn.get_attribute('class')
-                    btn_id = await btn.get_attribute('id')
-                    data_test = await btn.get_attribute('data-test')
-                    is_visible = await btn.is_visible()
-                    # Only log buttons that might be relevant
-                    if text and (len(text.strip()) > 0 and len(text.strip()) < 100):
-                        logger.info(f"[CART] Button {i}: text='{text.strip()}', id='{btn_id}', class='{classes}', visible={is_visible}")
-                except Exception as e:
-                    logger.debug(f"[CART] Could not analyze button {i}: {e}")
-            
-            logger.info("[CART] Checking for size/variant selectors...")
-            variant_selected = False
-            for selector in settings.variant_selectors:
-                try:
-                    variant_elements = await page.query_selector_all(selector)
-                    if variant_elements:
-                        logger.info(f"[CART] Found {len(variant_elements)} size options with selector: {selector}")
-                        # Try to select the first available option
-                        for i, element in enumerate(variant_elements):
-                            try:
-                                # Check if element is visible
-                                is_visible = await element.is_visible()
-                                if not is_visible:
-                                    logger.debug(f"[CART] Variant #{i} is hidden, skipping")
-                                    continue
-                                
-                                tag_name = await element.evaluate('el => el.tagName.toLowerCase()')
-                                is_disabled = await element.is_disabled() if tag_name in ['button', 'input'] else False
-                                
-                                if tag_name == 'select':
-                                    # Select first available non-placeholder option
-                                    await element.select_option(index=1)
-                                    logger.info(f"[CART] Selected variant from visible dropdown (option 1)")
-                                    variant_selected = True
-                                    break
-                                elif tag_name in ['button', 'a'] and not is_disabled:
-                                    # Click button or link
-                                    await element.click()
-                                    logger.info(f"[CART] Clicked visible variant {tag_name} #{i}")
-                                    variant_selected = True
-                                    break
-                                elif tag_name == 'label':
-                                    # Click label (will trigger associated radio button)
-                                    await element.click()
-                                    logger.info(f"[CART] Clicked variant label #{i}")
-                                    variant_selected = True
-                                    break
-                                elif tag_name == 'input' and not is_disabled:
-                                    # Try to click radio/checkbox
-                                    await element.click()
-                                    logger.info(f"[CART] Clicked variant input #{i}")
-                                    variant_selected = True
-                                    break
-                            except Exception as e:
-                                logger.debug(f"[CART] Failed to select variant #{i}: {e}")
-                                continue
-                        if variant_selected:
-                            break  # Exit outer loop if we successfully selected a variant
-                except Exception as e:
-                    logger.debug(f"[CART] Variant selector {selector} failed: {e}")
-                    continue
-            
+
+            # Step 1: Dismiss cookie banner if needed
+            await self._dismiss_cookie_banner_if_needed(page)
+
+            # Step 2: Select product variant if needed
+            variant_selected = await self._select_product_variant_if_needed(page)
             if variant_selected:
                 logger.info("[CART] Waiting for add-to-cart button to become enabled after variant selection...")
-                await asyncio.sleep(settings.variant_select_wait)  # Wait for button to enable
-            
-            # Try using JavaScript to find the add-to-cart button/link
-            logger.info("[CART] Using JavaScript to find add-to-cart button...")
-            add_to_cart_element = await page.evaluate('''() => {
-                // Look for elements with cart-related text (Danish and English)
-                const cartTexts = ['læg i kurv', 'læg i indkøbskurven', 'tilføj til kurv', 'køb nu', 'add to cart', 'add to basket'];
-                
-                // Check buttons and links ONLY (not divs or spans with onclick)
-                const elements = document.querySelectorAll('a.button, a.buy-button, button, input[type="submit"]');
-                
-                for (const el of elements) {
-                    const text = (el.textContent || el.value || '').toLowerCase().trim();
-                    
-                    // Must match cart text and be reasonably short (not a paragraph of review text)
-                    if (text.length < 100 && cartTexts.some(ct => text.includes(ct))) {
-                        return {
-                            tag: el.tagName,
-                            text: text,
-                            class: el.className,
-                            id: el.id,
-                            href: el.href || null
-                        };
-                    }
-                }
-                return null;
-            }''')
-            
-            if add_to_cart_element:
-                logger.info(f"[CART] JavaScript found add-to-cart: tag={add_to_cart_element['tag']}, text='{add_to_cart_element['text'][:50]}', class={add_to_cart_element['class']}")
-                
-                # Try to click it using the found information
-                try:
-                    # Use href if it's a link
-                    if add_to_cart_element.get('href'):
-                        selector = f"a[href='{add_to_cart_element['href']}']"
-                    elif add_to_cart_element.get('class'):
-                        # Use class if available - try exact class match first
-                        classes = add_to_cart_element['class'].split()
-                        if len(classes) > 1:
-                            # Use first two classes for more specific selector
-                            selector = f"a.{classes[0]}.{classes[1]}" if add_to_cart_element['tag'] == 'A' else f"button.{classes[0]}.{classes[1]}"
-                        else:
-                            selector = f"a.{classes[0]}" if add_to_cart_element['tag'] == 'A' else f"button.{classes[0]}"
-                    elif add_to_cart_element.get('id'):
-                        selector = f"#{add_to_cart_element['id']}"
-                    else:
-                        # Fallback to text matching (shortened)
-                        selector = f"{add_to_cart_element['tag'].lower()}:has-text('{add_to_cart_element['text'][:15]}')"
-                    
-                    logger.info(f"[CART] Trying JavaScript-discovered selector: {selector}")
-                    cart_button = await page.query_selector(selector)
-                    if cart_button and await cart_button.is_visible() and await cart_button.is_enabled():
-                        logger.info(f"[CART] Successfully found button with JS-discovered selector!")
-                    else:
-                        logger.warning(f"[CART] JS selector found button but it's not visible/enabled")
-                        cart_button = None
-                except Exception as e:
-                    logger.warning(f"[CART] Failed to find button using discovered selector: {e}")
-                    cart_button = None
-            else:
-                logger.info("[CART] JavaScript did not find add-to-cart button")
-                cart_button = None
-            
-            # If JavaScript didn't find it, try traditional selectors
-            if not cart_button:
-                for selector in settings.add_to_cart_selectors:
-                    try:
-                        logger.info(f"[CART] Trying selector: {selector}")
-                        cart_button = await page.query_selector(selector)
-                        if cart_button:
-                            # Check if button is visible and enabled
-                            is_visible = await cart_button.is_visible()
-                            is_enabled = await cart_button.is_enabled()
-                            logger.info(f"[CART] Found button with {selector}: visible={is_visible}, enabled={is_enabled}")
-                            
-                            if is_visible and is_enabled:
-                                logger.info(f"[CART] Using add-to-cart button: {selector}")
-                                break
-                            else:
-                                cart_button = None  # Reset if not usable
-                    except Exception as e:
-                        logger.debug(f"[CART] Selector {selector} failed: {e}")
-                        continue
-            
+                await asyncio.sleep(settings.variant_select_wait)
+
+            # Step 3: Find add-to-cart button
+            cart_button = await self._find_add_to_cart_button(page)
             if not cart_button:
                 logger.info("[CART] No add-to-cart button found, skipping cart extraction")
                 return []
-            
-            # Click add to cart
-            try:
-                # Record URL before clicking to detect navigation
-                url_before = page.url
-                
-                # Click without waiting for navigation (some sites open modals)
-                try:
-                    await cart_button.click(timeout=5000, no_wait_after=True)
-                    logger.info("[CART] Clicked add-to-cart button")
-                except Exception as click_error:
-                    # If click fails, try with force click
-                    logger.warning(f"[CART] Normal click failed: {click_error}, trying force click...")
-                    await cart_button.click(force=True, no_wait_after=True)
-                    logger.info("[CART] Force-clicked add-to-cart button")
-                
-                # Wait for cart to update (modal or navigation)
-                await asyncio.sleep(settings.cart_modal_wait)  # Wait for cart modal/page to appear
-                
-                # Validate that something cart-related happened
-                url_after = page.url
-                cart_validation_passed = False
-                
-                # Check 0: Use JavaScript to detect cart state changes
-                cart_state = await page.evaluate('''() => {
-                    // Check for common cart state indicators
-                    const indicators = {
-                        cartCountElement: null,
-                        cartCountValue: null,
-                        cartModal: null,
-                        checkoutButton: null
-                    };
-                    
-                    // Look for cart count/badge
-                    const countSelectors = ['[class*="cart-count"]', '[class*="cart-badge"]', '[class*="cart-quantity"]', '[class*="CartBadge"]', '[data-test*="cart-count"]'];
-                    for (const sel of countSelectors) {
-                        const el = document.querySelector(sel);
-                        if (el) {
-                            indicators.cartCountElement = sel;
-                            indicators.cartCountValue = el.textContent || el.innerText;
-                            break;
-                        }
-                    }
-                    
-                    // Look for visible cart modals or drawers
-                    const modalSelectors = ['[class*="cart-modal"]', '[class*="CartModal"]', '[class*="mini-cart"]', '[class*="MiniCart"]', '[class*="cart-drawer"]'];
-                    for (const sel of modalSelectors) {
-                        const el = document.querySelector(sel);
-                        if (el && (el.offsetParent !== null || window.getComputedStyle(el).display !== 'none')) {
-                            indicators.cartModal = sel;
-                            break;
-                        }
-                    }
-                    
-                    // Look for checkout/view cart buttons (usually appear after add-to-cart)
-                    const checkoutTexts = ['se kurv', 'gå til kurv', 'view cart', 'checkout', 'til kassen'];
-                    for (const text of checkoutTexts) {
-                        const buttons = Array.from(document.querySelectorAll('button, a'));
-                        const btn = buttons.find(b => b.textContent.toLowerCase().includes(text) && (b.offsetParent !== null));
-                        if (btn) {
-                            indicators.checkoutButton = text;
-                            break;
-                        }
-                    }
-                    
-                    return indicators;
-                }''')
-                
-                if cart_state:
-                    if cart_state.get('cartCountValue') and cart_state['cartCountValue'].strip() not in ['0', '']:
-                        logger.info(f"[CART] Validation passed (JS): Cart count shows {cart_state['cartCountValue']}")
-                        cart_validation_passed = True
-                    elif cart_state.get('cartModal'):
-                        logger.info(f"[CART] Validation passed (JS): Cart modal visible: {cart_state['cartModal']}")
-                        cart_validation_passed = True
-                    elif cart_state.get('checkoutButton'):
-                        logger.info(f"[CART] Validation passed (JS): Checkout button found: {cart_state['checkoutButton']}")
-                        cart_validation_passed = True
-                    else:
-                        logger.info(f"[CART] JS cart state: {cart_state}")
-                
-                # Check 1: Did URL change to cart/checkout?
-                if url_after != url_before:
-                    if any(keyword in url_after.lower() for keyword in ['/cart', '/kurv', '/kassen', '/checkout', '/basket']):
-                        logger.info(f"[CART] Validation passed: URL changed to cart/checkout: {url_after}")
-                        cart_validation_passed = True
-                    else:
-                        logger.warning(f"[CART] URL changed but doesn't look like cart: {url_before} -> {url_after}")
-                
-                # Check 2: Look for cart modal/widget indicators
-                if not cart_validation_passed:
-                    for indicator in settings.cart_indicator_selectors:
-                        try:
-                            element = await page.query_selector(indicator)
-                            if element and await element.is_visible():
-                                logger.info(f"[CART] Validation passed: Found cart indicator: {indicator}")
-                                cart_validation_passed = True
-                                break
-                        except Exception:
-                            continue
-                
-                # Check 3: Look for cart icon with quantity
-                if not cart_validation_passed:
-                    for indicator in settings.cart_quantity_selectors:
-                        try:
-                            element = await page.query_selector(indicator)
-                            if element:
-                                text = await element.inner_text()
-                                if text and text.strip() and text.strip() != '0':
-                                    logger.info(f"[CART] Validation passed: Cart quantity shows: {text}")
-                                    cart_validation_passed = True
-                                    break
-                        except Exception:
-                            continue
-                
-                if not cart_validation_passed:
-                    logger.warning("[CART] Failed to validate add-to-cart action - no cart indicators found")
-                    logger.info("[CART] Button might have navigated instead of adding to cart")
-                    # Wait a bit more and try validation again before giving up
-                    await asyncio.sleep(settings.validation_retry_wait)
-                    
-                    # Try validation one more time
-                    for indicator in settings.cart_indicator_selectors:
-                        try:
-                            element = await page.query_selector(indicator)
-                            if element and await element.is_visible():
-                                logger.info(f"[CART] Validation passed (retry): Found cart indicator: {indicator}")
-                                cart_validation_passed = True
-                                break
-                        except Exception:
-                            continue
-                    
-                    if not cart_validation_passed:
-                        logger.warning("[CART] Still no cart validation after retry - cart might be empty")
-                        logger.info("[CART] Skipping checkout extraction due to likely empty cart")
-                        return []  # Don't proceed with empty cart
-                    
-            except Exception as e:
-                logger.warning(f"[CART] Failed to click add-to-cart: {e}")
-                logger.info("[CART] Continuing to look for checkout link despite click failure...")
-                # Try to navigate to cart page directly
-                try:
-                    current_url = page.url
-                    from urllib.parse import urlparse, urljoin
-                    parsed = urlparse(current_url)
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
-                    
-                    # Try checkout URLs first (not cart - we want to go straight to checkout)
-                    checkout_urls = [
-                        urljoin(base_url, '/checkout'),
-                        urljoin(base_url, '/kassen'),
-                        urljoin(base_url, '/levering'),  # Danish - Delivery page
-                    ]
-                    
-                    navigated_to_checkout = False
-                    for checkout_url in checkout_urls:
-                        try:
-                            logger.info(f"[CART] Attempting to navigate directly to: {checkout_url}")
-                            await page.goto(checkout_url, wait_until='domcontentloaded', timeout=settings.navigation_timeout)
-                            await asyncio.sleep(settings.page_update_wait)
-                            # Check if we're on a checkout page
-                            current = page.url.lower()
-                            if any(keyword in current for keyword in ['/checkout', '/kassen', '/levering']):
-                                logger.info(f"[CART] Successfully navigated to checkout: {page.url}")
-                                navigated_to_checkout = True
-                                break
-                        except Exception as nav_error:
-                            logger.debug(f"[CART] Failed to navigate to {checkout_url}: {nav_error}")
-                            continue
-                    
-                    # If checkout URLs failed, try cart URLs and then look for checkout button
-                    if not navigated_to_checkout:
-                        cart_urls = [
-                            urljoin(base_url, '/cart'),
-                            urljoin(base_url, '/kurv'),
-                        ]
-                        for cart_url in cart_urls:
-                            try:
-                                logger.info(f"[CART] Attempting to navigate to cart: {cart_url}")
-                                await page.goto(cart_url, wait_until='domcontentloaded', timeout=settings.navigation_timeout)
-                                await asyncio.sleep(settings.page_update_wait)
-                                current = page.url.lower()
-                                if any(keyword in current for keyword in ['/cart', '/kurv']):
-                                    logger.info(f"[CART] Successfully navigated to cart: {page.url}")
-                                    break
-                            except Exception as nav_error:
-                                logger.debug(f"[CART] Failed to navigate to {cart_url}: {nav_error}")
-                                continue
-                                
-                except Exception as nav_ex:
-                    logger.warning(f"[CART] Failed to navigate to cart/checkout directly: {nav_ex}")
-            
+
+            # Step 4: Click add-to-cart and validate
+            cart_validated = await self._click_add_to_cart_and_validate(page, cart_button)
+            if not cart_validated:
+                logger.warning("[CART] Cart validation failed, attempting direct navigation to checkout...")
+                navigated = await self._navigate_to_checkout_page(page)
+                if not navigated:
+                    logger.warning("[CART] Failed to navigate to checkout - skipping shipping extraction")
+                    return []
+
             # Look for cart/checkout button (both in modal and on page)
             checkout_link = None
             for selector in settings.checkout_selectors:
@@ -1072,59 +1081,60 @@ class ScraperService:
                             checkout_link = None
                 except Exception:
                     continue
-            
+
             # Check if we're already on a checkout page (after direct navigation)
             current_url = page.url.lower()
-            already_on_checkout = any(keyword in current_url for keyword in ['/checkout', '/kassen', '/levering'])
-            
+            already_on_checkout = any(keyword in current_url for keyword in ["/checkout", "/kassen", "/levering"])
+
             if already_on_checkout and not checkout_link:
                 logger.info(f"[CART] Already on checkout page: {page.url}, proceeding to fill forms...")
                 checkout_success = True
                 # Try to fill checkout details
                 await self._fill_checkout_details_if_needed(page)
-            
+
             # After adding to cart, navigate directly to the appropriate checkout page based on domain
             elif checkout_link or True:  # Always try direct navigation after adding to cart
                 try:
                     logger.info(f"[CART] Waiting for cart to update...")
                     await asyncio.sleep(settings.cart_modal_wait)  # Wait for cart to update with added item
-                    
+
                     # Get the base URL from current page
                     current_url = page.url
                     from urllib.parse import urlparse
+
                     parsed = urlparse(current_url)
                     base_url = f"{parsed.scheme}://{parsed.netloc}"
                     domain = parsed.netloc.lower()
-                    
+
                     # Determine the correct checkout page based on domain
                     checkout_path = None
-                    if 'matas' in domain:
-                        checkout_path = '/levering'  # matas.dk uses /levering for delivery/checkout
+                    if "matas" in domain:
+                        checkout_path = "/levering"  # matas.dk uses /levering for delivery/checkout
                         logger.info("[CART] Detected matas.dk - will navigate to /levering")
-                    elif 'jollyroom' in domain:
-                        checkout_path = '/kassen'  # jollyroom.dk uses /kassen for checkout
+                    elif "jollyroom" in domain:
+                        checkout_path = "/kassen"  # jollyroom.dk uses /kassen for checkout
                         logger.info("[CART] Detected jollyroom.dk - will navigate to /kassen")
-                    elif 'brudsikreglas' in domain:
-                        checkout_path = '/checkout/'  # brudsikreglas.dk uses /checkout/
+                    elif "brudsikreglas" in domain:
+                        checkout_path = "/checkout/"  # brudsikreglas.dk uses /checkout/
                         logger.info("[CART] Detected brudsikreglas.dk - will navigate to /checkout/")
                     else:
                         # Generic fallback - try common checkout paths
-                        checkout_path = '/checkout'
+                        checkout_path = "/checkout"
                         logger.info(f"[CART] Unknown domain, trying generic /checkout")
-                    
+
                     # Build the full checkout URL
                     checkout_url = f"{base_url}{checkout_path}"
-                    
+
                     logger.info(f"[CART] Navigating directly to checkout page: {checkout_url}")
-                    await page.goto(checkout_url, wait_until='domcontentloaded', timeout=settings.page_timeout)
+                    await page.goto(checkout_url, wait_until="domcontentloaded", timeout=settings.page_timeout)
                     await asyncio.sleep(settings.page_update_wait)
                     checkout_success = True
                     logger.info(f"[CART] Successfully navigated to: {page.url}")
-                    
+
                     # Now we're on the checkout page with the added item in basket
                     # Proceed directly to fill checkout details
                     await self._fill_checkout_details_if_needed(page)
-                        
+
                 except Exception as e:
                     logger.warning(f"[CART] Error during checkout navigation: {e}")
                     logger.info(f"[CART] Will extract from current page/modal")
@@ -1133,9 +1143,9 @@ class ScraperService:
                 # Try to look for checkout button and navigate, or try filling forms if already on checkout
                 logger.info("[CART] No checkout link found")
                 current_page_url = page.url.lower()
-                
+
                 # If on cart page, try to find and click checkout button
-                if any(keyword in current_page_url for keyword in ['/cart', '/kurv', '/basket']):
+                if any(keyword in current_page_url for keyword in ["/cart", "/kurv", "/basket"]):
                     logger.info("[CART] On cart page, looking for checkout button to proceed...")
                     # Try button selectors (not just links)
                     checkout_button = None
@@ -1154,7 +1164,7 @@ class ScraperService:
                         except Exception as btn_err:
                             logger.debug(f"[CART] Button {btn_sel} failed: {btn_err}")
                             continue
-                    
+
                     if not checkout_button:
                         logger.warning("[CART] Could not find checkout button on cart page")
                 else:
@@ -1166,42 +1176,62 @@ class ScraperService:
             try:
                 # First, try to expand any collapsed shipping sections/cards
                 await self._expand_shipping_sections(page)
-                
+
                 html_content = await page.content()
-                cart_soup = BeautifulSoup(html_content, 'html.parser')
+                cart_soup = BeautifulSoup(html_content, "html.parser")
             except Exception as e:
                 logger.warning(f"[CART] Failed to get page content: {e}")
                 return []
-            
+
             # Look for shipping options in checkout
             shipping_sections = []
-            
+
             # Strategy 1: Find individual shipping option cards/containers
             # Look for elements that likely represent individual shipping options
             card_selectors = [
-                {'class': lambda x: x and any(k in ' '.join(x).lower() for k in ['shipping-option', 'delivery-option', 'shipping-card', 'delivery-method'])},
-                {'class': lambda x: x and 'radio' in ' '.join(x).lower() and 'label' in ' '.join(x).lower()},
+                {
+                    "class": lambda x: x
+                    and any(
+                        k in " ".join(x).lower()
+                        for k in ["shipping-option", "delivery-option", "shipping-card", "delivery-method"]
+                    )
+                },
+                {"class": lambda x: x and "radio" in " ".join(x).lower() and "label" in " ".join(x).lower()},
             ]
-            
+
             for selector in card_selectors:
-                cards = cart_soup.find_all(['div', 'li', 'label'], attrs=selector)
+                cards = cart_soup.find_all(["div", "li", "label"], attrs=selector)
                 shipping_sections.extend(cards)
-            
+
             # Strategy 2: Find shipping method radio buttons and their labels
-            shipping_radios = cart_soup.find_all('input', attrs={'type': 'radio', 'name': lambda x: x and ('shipping' in x.lower() or 'levering' in x.lower()) if x else False})
+            shipping_radios = cart_soup.find_all(
+                "input",
+                attrs={
+                    "type": "radio",
+                    "name": lambda x: x and ("shipping" in x.lower() or "levering" in x.lower()) if x else False,
+                },
+            )
             for radio in shipping_radios:
                 # Get the label associated with this radio button
-                radio_id = radio.get('id')
+                radio_id = radio.get("id")
                 if radio_id:
-                    label = cart_soup.find('label', attrs={'for': radio_id})
+                    label = cart_soup.find("label", attrs={"for": radio_id})
                     if label:
                         shipping_sections.append(label)
                 # Also check parent container (but only immediate parent, not grandparent)
-                if radio.parent and radio.parent.name in ['div', 'li', 'label']:
+                if radio.parent and radio.parent.name in ["div", "li", "label"]:
                     shipping_sections.append(radio.parent)
-            
+
             # Strategy 3: Find by class/id keywords (but filter out large containers)
-            for keyword in ['shipping', 'delivery', 'levering', 'forsendelse', 'fragt', 'shipping_method', 'shipping-method']:
+            for keyword in [
+                "shipping",
+                "delivery",
+                "levering",
+                "forsendelse",
+                "fragt",
+                "shipping_method",
+                "shipping-method",
+            ]:
                 sections = cart_soup.find_all(class_=lambda x: x and keyword in x.lower() if x else False)
                 # Filter: only add if the section is relatively small (not a large container)
                 for section in sections:
@@ -1209,7 +1239,7 @@ class ScraperService:
                     # Skip if text is too long (likely a container) or too short
                     if 20 < text_len < 500:
                         shipping_sections.append(section)
-            
+
             # Remove duplicates while preserving order
             seen = set()
             unique_sections = []
@@ -1219,97 +1249,120 @@ class ScraperService:
                     seen.add(section_str)
                     unique_sections.append(section)
             shipping_sections = unique_sections
-            
+
             logger.info(f"[CART] Found {len(shipping_sections)} potential shipping sections")
-            
+
             # Extract shipping providers from checkout sections
             seen_providers = set()
             for section in shipping_sections[:10]:
-                text = section.get_text(separator=' ', strip=True)
+                text = section.get_text(separator=" ", strip=True)
                 text_lower = text.lower()
-                
+
                 logger.info(f"[CART] Analyzing shipping option: {text[:200]}...")
-                
+
                 # Skip product variations and non-shipping content
                 skip_keywords = [
-                    'choose an option', 'vælg', 'se priser', 'varenummer', 
-                    'antal', 'quantity', 'tilføj til', 'add to', 'læg i kurv',
-                    'product', 'produkt', 'stk.', 'v/300', 'v/200', 'v/150'
+                    "choose an option",
+                    "vælg",
+                    "se priser",
+                    "varenummer",
+                    "antal",
+                    "quantity",
+                    "tilføj til",
+                    "add to",
+                    "læg i kurv",
+                    "product",
+                    "produkt",
+                    "stk.",
+                    "v/300",
+                    "v/200",
+                    "v/150",
                 ]
                 if any(keyword in text_lower for keyword in skip_keywords):
                     logger.info(f"[CART] Skipping - appears to be product variation, not shipping")
                     continue
-                
+
                 # Extract provider name with multiple strategies
                 provider_name = None
                 providers_list = []  # To handle multiple providers in one section (e.g., "GLS, DAO eller PostNord")
-                
+
                 # Strategy 1: Check for known provider keywords (cart extraction)
                 # Order matters - check most specific first
                 known_providers = {
-                    'burd express': 'Burd Express',  # Check multi-word first
-                    'post nord': 'PostNord',
-                    'postnord': 'PostNord',
-                    'pakkeshop': 'PostNord Pakkeshop',
-                    'pakkeboks': 'PostNord Pakkeboks',
-                    'gls': 'GLS',
-                    'dao': 'DAO',  # Danish delivery service
-                    'bring': 'Bring',
-                    'burd': 'Burd',  # Burd Express
-                    'dhl': 'DHL',
-                    'ups': 'UPS',
-                    'fedex': 'FedEx',
-                    'dpd': 'DPD',
-                    'pdk': 'PDK',
-                    'swipbox': 'Swipbox',
-                    'budbee': 'Budbee',
-                    'packeta': 'Packeta',
-                    'matas': 'Matas'  # Matas butik (in-store pickup)
+                    "burd express": "Burd Express",  # Check multi-word first
+                    "post nord": "PostNord",
+                    "postnord": "PostNord",
+                    "pakkeshop": "PostNord Pakkeshop",
+                    "pakkeboks": "PostNord Pakkeboks",
+                    "gls": "GLS",
+                    "dao": "DAO",  # Danish delivery service
+                    "bring": "Bring",
+                    "burd": "Burd",  # Burd Express
+                    "dhl": "DHL",
+                    "ups": "UPS",
+                    "fedex": "FedEx",
+                    "dpd": "DPD",
+                    "pdk": "PDK",
+                    "swipbox": "Swipbox",
+                    "budbee": "Budbee",
+                    "packeta": "Packeta",
+                    "matas": "Matas",  # Matas butik (in-store pickup)
                 }
-                
+
                 import re
+
                 # Find ALL providers in the text (e.g., "GLS, DAO eller PostNord" should find all three)
                 for keyword, name in known_providers.items():
                     # Use word boundary matching to avoid false positives
-                    pattern = r'\b' + re.escape(keyword) + r'\b'
+                    pattern = r"\b" + re.escape(keyword) + r"\b"
                     if re.search(pattern, text_lower, re.IGNORECASE):
                         if name not in providers_list:
                             providers_list.append(name)
                             logger.info(f"[CART] Detected provider: {name}")
-                
+
                 # If we found multiple providers, use the combined name or take the primary one
                 if len(providers_list) > 1:
                     provider_name = " / ".join(providers_list)  # e.g., "GLS / DAO / PostNord"
                 elif len(providers_list) == 1:
                     provider_name = providers_list[0]
-                
+
                 # Strategy 2: Extract from common patterns
                 if not provider_name:
                     import re
+
                     patterns = [
-                        r'(?:levering|forsendelse|fragt)\s+(?:med|via|by)\s+([A-Z][A-Za-z]+)',
-                        r'([A-Z][A-Za-z]+)\s+(?:levering|forsendelse|delivery|shipping)',
-                        r'(?:via|by)\s+([A-Z][A-Za-z]+)',
+                        r"(?:levering|forsendelse|fragt)\s+(?:med|via|by)\s+([A-Z][A-Za-z]+)",
+                        r"([A-Z][A-Za-z]+)\s+(?:levering|forsendelse|delivery|shipping)",
+                        r"(?:via|by)\s+([A-Z][A-Za-z]+)",
                     ]
                     for pattern in patterns:
                         match = re.search(pattern, text)
                         if match:
                             potential_name = match.group(1)
-                            if potential_name.lower() not in ['levering', 'delivery', 'shipping', 'standard', 'express', 'hurtig', 'normal']:
+                            if potential_name.lower() not in [
+                                "levering",
+                                "delivery",
+                                "shipping",
+                                "standard",
+                                "express",
+                                "hurtig",
+                                "normal",
+                            ]:
                                 provider_name = potential_name
                                 logger.info(f"[CART] Extracted provider from pattern: {provider_name}")
                                 break
-                
+
                 # Extract price - look for "Fra X kr" or "X kr" patterns
                 cost = None
                 currency = "DKK"
-                
+
                 # Check for "Fra X kr" (from X kr) - minimum price
                 import re
-                fra_match = re.search(r'fra\s+(\d+[.,]?\d*)\s*kr', text_lower)
+
+                fra_match = re.search(r"fra\s+(\d+[.,]?\d*)\s*kr", text_lower)
                 if fra_match:
-                    cost = float(fra_match.group(1).replace(',', '.'))
-                    currency = 'DKK'
+                    cost = float(fra_match.group(1).replace(",", "."))
+                    currency = "DKK"
                     logger.info(f"[CART] Found minimum shipping price: Fra {cost} {currency}")
                 else:
                     # Try standard price extraction
@@ -1317,80 +1370,96 @@ class ScraperService:
                     if price_match:
                         cost, currency = price_match
                         logger.info(f"[CART] Found shipping price: {cost} {currency}")
-                
+
                 # Check for free shipping
-                is_free = any(word in text_lower for word in ['gratis', 'free', 'fri'])
+                is_free = any(word in text_lower for word in ["gratis", "free", "fri"])
                 if is_free and cost is None:
                     cost = 0.0
                     logger.info(f"[CART] Free shipping option found")
-                
+
                 # Extract delivery time
                 delivery_time = self.data_extractor.extract_delivery_time_with_regex(text)
-                
+
                 # Classify delivery type based on text content
                 delivery_type = self._classify_delivery_type(text_lower)
-                
+
                 # Only add if we have meaningful info
                 if provider_name or cost is not None or is_free:
                     final_name = provider_name or ("Free Shipping" if is_free else "Standard Shipping")
-                    
+
                     # Deduplicate
                     provider_key = f"{final_name}_{cost}_{delivery_type}"
                     if provider_key in seen_providers:
                         continue
                     seen_providers.add(provider_key)
-                    
-                    providers.append(ShippingProvider(
-                        name=final_name,
-                        price=cost,
-                        currency=currency if cost is not None else None,
-                        delivery_time=delivery_time or "Unknown",
-                        delivery_type=delivery_type,
-                        description=text[:200] if len(text) > 200 else text
-                    ))
-                    logger.info(f"[CART] Extracted shipping: {final_name}, {cost} {currency if cost else 'TBD'}, Type: {delivery_type}")
-            
+
+                    providers.append(
+                        ShippingProvider(
+                            name=final_name,
+                            price=cost,
+                            currency=currency if cost is not None else None,
+                            delivery_time=delivery_time or "Unknown",
+                            delivery_type=delivery_type,
+                            description=text[:200] if len(text) > 200 else text,
+                        )
+                    )
+                    logger.info(
+                        f"[CART] Extracted shipping: {final_name}, {cost} {currency if cost else 'TBD'}, Type: {delivery_type}"
+                    )
+
             if providers:
                 logger.info(f"[CART] Successfully extracted {len(providers)} shipping provider(s) from cart/checkout")
             else:
                 logger.info("[CART] No shipping providers found in cart/checkout")
-            
+
         except Exception as e:
             logger.warning(f"[CART] Error extracting shipping from cart: {e}")
             logger.debug(f"[CART] Traceback: {traceback.format_exc()}")
-        
+
         return providers
-    
+
     async def _extract_shipping_providers(self, soup: BeautifulSoup) -> List[ShippingProvider]:
         """Extract shipping provider information from page"""
         providers = []
         try:
             # Common shipping provider keywords
             shipping_keywords = [
-                'levering', 'delivery', 'shipping', 'forsendelse', 'fragt',
-                'dhl', 'postnord', 'gls', 'dao', 'ups', 'fedex', 'bring',
-                'gratis', 'free', 'fri'
+                "levering",
+                "delivery",
+                "shipping",
+                "forsendelse",
+                "fragt",
+                "dhl",
+                "postnord",
+                "gls",
+                "dao",
+                "ups",
+                "fedex",
+                "bring",
+                "gratis",
+                "free",
+                "fri",
             ]
-            
+
             # Search for shipping information in common locations
             shipping_sections = []
-            
+
             # Look for shipping/delivery divs and spans, but exclude script and style tags
-            for keyword in ['delivery', 'shipping', 'levering', 'forsendelse', 'fragt']:
+            for keyword in ["delivery", "shipping", "levering", "forsendelse", "fragt"]:
                 # Find elements with shipping-related classes, but not in script/style
                 sections = soup.find_all(class_=lambda x: x and keyword in x.lower() if x else False)
                 for section in sections:
                     # Skip if it's inside a script or style tag
-                    if section.find_parent(['script', 'style']):
+                    if section.find_parent(["script", "style"]):
                         continue
                     shipping_sections.append(section)
-                
+
                 # Also check for spans/divs with shipping text, but exclude script/style
                 text_sections = soup.find_all(text=lambda t: t and keyword in t.lower() if t else False)
                 for ts in text_sections:
-                    if ts.parent and not ts.find_parent(['script', 'style']):
+                    if ts.parent and not ts.find_parent(["script", "style"]):
                         shipping_sections.append(ts.parent)
-            
+
             # Deduplicate sections
             unique_sections = []
             seen_texts = set()
@@ -1399,93 +1468,105 @@ class ScraperService:
                 if text and text not in seen_texts:
                     unique_sections.append(section)
                     seen_texts.add(text)
-            
+
             # Look for shipping info in text
             for section in unique_sections[:5]:  # Limit to first 5 unique sections
                 text = section.get_text(strip=True)
                 text_lower = text.lower()
-                
+
                 logger.info(f"[SHIPPING] Analyzing: {text[:150]}...")
-                
+
                 # Check if this section actually contains useful shipping info
                 has_shipping_info = any(k in text_lower for k in shipping_keywords)
                 if not has_shipping_info:
                     continue
-                
+
                 # Extract provider name with multiple strategies
                 provider_name = None
-                
+
                 # Strategy 1: Check for known provider keywords (page extraction)
                 known_providers = {
-                    'postnord': 'PostNord',
-                    'post nord': 'PostNord',
-                    'pakkeshop': 'PostNord',  # PostNord Pakkeshop
-                    'gls': 'GLS',
-                    'dao': 'DAO',
-                    'bring': 'Bring',
-                    'dhl': 'DHL',
-                    'ups': 'UPS',
-                    'fedex': 'FedEx',
-                    'dpd': 'DPD',
-                    'pdk': 'PDK',
-                    'swipbox': 'Swipbox',
-                    'budbee': 'Budbee',
-                    'packeta': 'Packeta'
+                    "postnord": "PostNord",
+                    "post nord": "PostNord",
+                    "pakkeshop": "PostNord",  # PostNord Pakkeshop
+                    "gls": "GLS",
+                    "dao": "DAO",
+                    "bring": "Bring",
+                    "dhl": "DHL",
+                    "ups": "UPS",
+                    "fedex": "FedEx",
+                    "dpd": "DPD",
+                    "pdk": "PDK",
+                    "swipbox": "Swipbox",
+                    "budbee": "Budbee",
+                    "packeta": "Packeta",
                 }
-                
+
                 import re
+
                 for keyword, name in known_providers.items():
                     # Use word boundary matching to avoid false positives like "ups" in "groups"
-                    pattern = r'\b' + re.escape(keyword) + r'\b'
+                    pattern = r"\b" + re.escape(keyword) + r"\b"
                     if re.search(pattern, text_lower, re.IGNORECASE):
                         provider_name = name
                         logger.info(f"[SHIPPING] Detected provider: {provider_name}")
                         break
-                
+
                 # Strategy 2: Extract from common patterns like "Levering med GLS" or "PostNord delivery"
                 if not provider_name:
                     import re
+
                     # Look for patterns like "levering med X", "delivery via X", "shipping by X"
                     patterns = [
-                        r'(?:levering|forsendelse|fragt)\s+(?:med|via|by)\s+([A-Z][A-Za-z]+)',
-                        r'([A-Z][A-Za-z]+)\s+(?:levering|forsendelse|delivery|shipping)',
-                        r'(?:via|by)\s+([A-Z][A-Za-z]+)',
+                        r"(?:levering|forsendelse|fragt)\s+(?:med|via|by)\s+([A-Z][A-Za-z]+)",
+                        r"([A-Z][A-Za-z]+)\s+(?:levering|forsendelse|delivery|shipping)",
+                        r"(?:via|by)\s+([A-Z][A-Za-z]+)",
                     ]
                     for pattern in patterns:
                         match = re.search(pattern, text)
                         if match:
                             potential_name = match.group(1)
                             # Verify it's not a common word
-                            if potential_name.lower() not in ['levering', 'delivery', 'shipping', 'standard', 'express', 'hurtig', 'normal']:
+                            if potential_name.lower() not in [
+                                "levering",
+                                "delivery",
+                                "shipping",
+                                "standard",
+                                "express",
+                                "hurtig",
+                                "normal",
+                            ]:
                                 provider_name = potential_name
                                 logger.info(f"[SHIPPING] Extracted provider from pattern: {provider_name}")
                                 break
-                
+
                 # Check for free shipping (gratis levering)
-                is_free = any(word in text_lower for word in ['gratis', 'free', 'fri levering', 'fri fragt'])
-                
+                is_free = any(word in text_lower for word in ["gratis", "free", "fri levering", "fri fragt"])
+
                 # Check for warehouse/direct delivery indicators (often means free or standard shipping)
-                has_standard_delivery = any(word in text_lower for word in [
-                    'levering', 'forsendelse', 'sendes', 'delivered', 'warehouse', 'lager'
-                ])
-                
+                has_standard_delivery = any(
+                    word in text_lower
+                    for word in ["levering", "forsendelse", "sendes", "delivered", "warehouse", "lager"]
+                )
+
                 # Extract delivery time
                 delivery_time = self.data_extractor.extract_delivery_time_with_regex(text)
                 if delivery_time:
                     logger.info(f"[SHIPPING] Detected delivery time: {delivery_time}")
-                
+
                 # Extract cost
                 cost = None
                 currency = "DKK"
-                
+
                 # Check if this section is about delivery time, not price
                 delivery_time_patterns = [
-                    r'\d+-\d+\s*(hverdage|arbejdsdage|dage|days)',  # "1-2 hverdage"
-                    r'(levering|delivery|shipping)\s*\d+-\d+\s*(hverdage|arbejdsdage|dage|days)',  # "levering 1-2 dage"
+                    r"\d+-\d+\s*(hverdage|arbejdsdage|dage|days)",  # "1-2 hverdage"
+                    r"(levering|delivery|shipping)\s*\d+-\d+\s*(hverdage|arbejdsdage|dage|days)",  # "levering 1-2 dage"
                 ]
                 import re
+
                 is_delivery_time_only = any(re.search(pattern, text_lower) for pattern in delivery_time_patterns)
-                
+
                 price_match = None
                 if is_delivery_time_only:
                     logger.info(f"[SHIPPING] Skipping - this is delivery time info, not shipping cost")
@@ -1503,7 +1584,7 @@ class ScraperService:
                             logger.info(f"[SHIPPING] Detected cost: {cost} {currency}")
                         else:
                             logger.info(f"[SHIPPING] Ignoring unrealistic shipping price: {extracted_price}")
-                
+
                 # Determine if we should add this provider
                 # RELIABLE criteria:
                 # 1. Specific provider name (DHL, PostNord, etc.)
@@ -1511,55 +1592,59 @@ class ScraperService:
                 # 3. Free shipping indicator
                 # 4. Standard delivery with delivery time (medium confidence)
                 has_confident_info = (
-                    provider_name or 
-                    (price_match and 0 < cost < 500) or 
-                    is_free or
-                    (has_standard_delivery and delivery_time)  # Medium confidence
+                    provider_name
+                    or (price_match and 0 < cost < 500)
+                    or is_free
+                    or (has_standard_delivery and delivery_time)  # Medium confidence
                 )
-                
+
                 if has_confident_info:
                     final_name = provider_name or ("Free Shipping" if is_free else "Standard Delivery")
                     final_description = text[:200] if len(text) > 200 else text
-                    
+
                     # Classify delivery type based on text content
                     delivery_type = self._classify_delivery_type(text_lower)
-                    
-                    providers.append(ShippingProvider(
-                        name=final_name,
-                        price=cost if (price_match or is_free) else None,  # None if we don't know the price
-                        currency=currency if (price_match or is_free) else None,
-                        delivery_time=delivery_time or "Unknown",
-                        delivery_type=delivery_type,
-                        description=final_description
-                    ))
-                    logger.info(f"[SHIPPING] Added: {final_name}, {cost if cost else 'Price TBD'} {currency if cost else ''}, {delivery_time or 'Unknown'}, Type: {delivery_type}")
+
+                    providers.append(
+                        ShippingProvider(
+                            name=final_name,
+                            price=cost if (price_match or is_free) else None,  # None if we don't know the price
+                            currency=currency if (price_match or is_free) else None,
+                            delivery_time=delivery_time or "Unknown",
+                            delivery_type=delivery_type,
+                            description=final_description,
+                        )
+                    )
+                    logger.info(
+                        f"[SHIPPING] Added: {final_name}, {cost if cost else 'Price TBD'} {currency if cost else ''}, {delivery_time or 'Unknown'}, Type: {delivery_type}"
+                    )
                 else:
                     logger.info(f"[SHIPPING] Skipping section - no confident shipping info found")
-            
+
             if providers:
                 logger.info(f"Extracted {len(providers)} shipping provider(s)")
-            
+
         except Exception as e:
             logger.warning(f"Error extracting shipping providers: {e}")
-        
+
         return providers
-    
+
     async def scrape_multiple(self, analyses: List[AnalysisResult]) -> List[ScrapedProduct]:
         """
         Scrape multiple products concurrently with error handling.
-        
+
         Args:
             analyses: List of AnalysisResult schemas
-            
+
         Returns:
             List of ScrapedProduct schemas
         """
         logger.info(f" Starting concurrent scrape of {len(analyses)} products")
-        
+
         # Scrape all products concurrently
         tasks = [self.scrape(analysis) for analysis in analyses]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Filter out None and exceptions, log errors
         products = []
         for i, result in enumerate(results):
@@ -1569,8 +1654,7 @@ class ScraperService:
                 logger.error(f"Product {i+1} failed with exception: {result}")
             else:
                 logger.warning(f"Product {i+1} returned None")
-        
-        logger.info(f" Successfully scraped {len(products)}/{len(analyses)} products")
-        
-        return products
 
+        logger.info(f" Successfully scraped {len(products)}/{len(analyses)} products")
+
+        return products
