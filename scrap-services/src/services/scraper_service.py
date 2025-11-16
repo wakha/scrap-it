@@ -108,27 +108,7 @@ class ScraperService:
 
                 # Handle cookie consent banners that might hide add-to-cart buttons
                 logger.info("[COOKIE] Checking for and dismissing cookie consent banners...")
-
-                cookie_dismissed = False
-                for cookie_sel in settings.cookie_selectors:
-                    try:
-                        cookie_btn = await page.query_selector(cookie_sel)
-                        if cookie_btn:
-                            is_visible = await cookie_btn.is_visible()
-                            if is_visible:
-                                await cookie_btn.click()
-                                logger.info(f"[COOKIE] Dismissed cookie banner with: {cookie_sel}")
-                                cookie_dismissed = True
-                                break
-                    except Exception as e:
-                        logger.debug(f"[COOKIE] Failed to click {cookie_sel}: {e}")
-                        continue
-
-                if not cookie_dismissed:
-                    logger.debug("[COOKIE] No cookie banner found or already dismissed")
-
-                # Store cookie dismissal state for later use
-                self._cookie_dismissed = cookie_dismissed
+                await self._dismiss_cookie_banner_if_needed(page, context="INITIAL_PAGE")
 
                 # Extract product information
                 logger.info("Extracting product data...")
@@ -652,6 +632,9 @@ class ScraperService:
 
             if expanded_count > 0:
                 logger.info(f"[CHECKOUT] Expanded {expanded_count} shipping sections")
+                # Check for cookie popups after expanding sections
+                await asyncio.sleep(0.3)
+                await self._dismiss_cookie_banner_if_needed(page, context="EXPAND_SHIPPING")
             else:
                 logger.info("[CHECKOUT] No expandable sections found or all already expanded")
 
@@ -843,6 +826,9 @@ class ScraperService:
 
                     # After clicking next, check if shipping prices are now visible
                     await asyncio.sleep(settings.page_update_wait)  # Wait for page to update
+                    
+                    # Check for cookie popups after navigation to new step
+                    await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_STEP")
                     html = await page.content()
                     import re
 
@@ -887,13 +873,21 @@ class ScraperService:
         except Exception as e:
             logger.warning(f"[CHECKOUT] Error filling checkout details: {e}")
 
-    async def _dismiss_cookie_banner_if_needed(self, page) -> bool:
-        """Dismiss cookie consent banner if present and not already dismissed."""
-        if hasattr(self, "_cookie_dismissed") and self._cookie_dismissed:
-            logger.info("[CART] Cookie banner already dismissed during page load, skipping...")
-            return True
-
-        logger.info("[CART] Checking for cookie consent banner...")
+    async def _dismiss_cookie_banner_if_needed(self, page, context: str = "PAGE") -> bool:
+        """Dismiss cookie consent banner if present. Checks dynamically on every call.
+        
+        Args:
+            page: Playwright page object
+            context: Context string for logging (e.g., 'PAGE', 'CART', 'CHECKOUT')
+            
+        Returns:
+            True if cookie banner was dismissed, False otherwise
+        """
+        logger.debug(f"[{context}] Checking for cookie consent banner...")
+        
+        # Wait briefly for any dynamic cookie popups to appear
+        await asyncio.sleep(0.5)
+        
         for cookie_sel in settings.cookie_selectors:
             try:
                 cookie_btn = await page.query_selector(cookie_sel)
@@ -901,13 +895,14 @@ class ScraperService:
                     is_visible = await cookie_btn.is_visible()
                     if is_visible:
                         await cookie_btn.click(timeout=1000)
-                        logger.info(f"[CART] Dismissed cookie banner: {cookie_sel}")
+                        logger.info(f"[{context}] ✓ Dismissed cookie banner: {cookie_sel}")
+                        await asyncio.sleep(0.3)  # Brief wait after dismissal
                         return True
             except Exception as e:
-                logger.debug(f"[CART] Cookie selector {cookie_sel} failed: {e}")
+                logger.debug(f"[{context}] Cookie selector {cookie_sel} failed: {e}")
                 continue
 
-        logger.info("[CART] No cookie banner found or already dismissed")
+        logger.debug(f"[{context}] No cookie banner found")
         return False
 
     async def _select_product_variant_if_needed(self, page) -> bool:
@@ -931,18 +926,26 @@ class ScraperService:
                             if tag_name == "select":
                                 await element.select_option(index=1)
                                 logger.info(f"[CART] Selected variant from visible dropdown (option 1)")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                             elif tag_name in ["button", "a"] and not is_disabled:
                                 await element.click()
                                 logger.info(f"[CART] Clicked visible variant {tag_name} #{i}")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                             elif tag_name == "label":
                                 await element.click()
                                 logger.info(f"[CART] Clicked variant label #{i}")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                             elif tag_name == "input" and not is_disabled:
                                 await element.click()
                                 logger.info(f"[CART] Clicked variant input #{i}")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                         except Exception as e:
                             logger.debug(f"[CART] Failed to select variant #{i}: {e}")
@@ -1047,6 +1050,12 @@ class ScraperService:
 
             # Wait for cart to update
             await asyncio.sleep(settings.cart_modal_wait)
+            
+            # Check for cookie popups after add-to-cart action (might appear in modal)
+            await self._dismiss_cookie_banner_if_needed(page, context="ADD_TO_CART")
+            
+            # Check for cookie popups after add-to-cart action (might appear in modal)
+            await self._dismiss_cookie_banner_if_needed(page, context="ADD_TO_CART")
 
             # Validate using JavaScript
             cart_state = await page.evaluate(
@@ -1173,6 +1182,10 @@ class ScraperService:
                     logger.info(f"[CART] Attempting to navigate directly to: {checkout_url}")
                     await page.goto(checkout_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout)
                     await asyncio.sleep(settings.page_update_wait)
+                    
+                    # Check for cookie popups after navigation
+                    await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_NAV")
+                    
                     current = page.url.lower()
                     if any(keyword in current for keyword in ["/checkout", "/kassen", "/levering"]):
                         logger.info(f"[CART] Successfully navigated to checkout: {page.url}")
@@ -1188,6 +1201,10 @@ class ScraperService:
                     logger.info(f"[CART] Attempting to navigate to cart: {cart_url}")
                     await page.goto(cart_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout)
                     await asyncio.sleep(settings.page_update_wait)
+                    
+                    # Check for cookie popups after navigation
+                    await self._dismiss_cookie_banner_if_needed(page, context="CART_PAGE")
+                    
                     current = page.url.lower()
                     if any(keyword in current for keyword in ["/cart", "/kurv"]):
                         logger.info(f"[CART] Successfully navigated to cart: {page.url}")
@@ -1212,7 +1229,7 @@ class ScraperService:
             logger.info("[CART] Attempting to extract shipping from cart/checkout...")
 
             # Step 1: Dismiss cookie banner if needed
-            await self._dismiss_cookie_banner_if_needed(page)
+            await self._dismiss_cookie_banner_if_needed(page, context="CART")
 
             # Step 2: Select product variant if needed
             variant_selected = await self._select_product_variant_if_needed(page)
@@ -1298,6 +1315,9 @@ class ScraperService:
                     await asyncio.sleep(settings.page_update_wait)
                     checkout_success = True
                     logger.info(f"[CART] Successfully navigated to: {page.url}")
+                    
+                    # Check for cookie popups after navigation
+                    await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_NAV")
 
                     # Now we're on the checkout page with the added item in basket
                     # Proceed directly to fill checkout details
@@ -1325,6 +1345,10 @@ class ScraperService:
                                 await checkout_button.click()
                                 await asyncio.sleep(settings.checkout_step_wait)
                                 logger.info(f"[CART] Clicked checkout button, now at: {page.url}")
+                                
+                                # Check for cookie popups after clicking checkout button
+                                await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_BUTTON")
+                                
                                 # Fill checkout details after navigating
                                 await self._fill_checkout_details_if_needed(page)
                                 checkout_success = True

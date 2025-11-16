@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 class AnalyzerService:
     """Service for website analysis using Playwright with error handling"""
 
+    # Class-level cache for tracking selected URLs per website domain
+    _selected_urls_cache: Dict[str, set] = {}
+    _max_cache_size_per_domain: int = 50  # Keep last 50 URLs per domain
+
     def __init__(self, timeout: int = None, headless: bool = True):
         self.playwright = None
         self.browser = None
@@ -171,9 +175,17 @@ class AnalyzerService:
 
         return analysis
 
-    def _score_product_url(self, url: str) -> int:
-        """Score a URL based on likelihood it's a product page. Higher = more likely."""
-        score = 0
+    def _score_product_url(self, url: str, add_randomness: bool = True) -> float:
+        """Score a URL based on likelihood it's a product page. Higher = more likely.
+        
+        Args:
+            url: The URL to score
+            add_randomness: If True, adds random variation to break deterministic ties
+            
+        Returns:
+            Float score (higher = more likely to be a product page)
+        """
+        score = 0.0
         url_lower = url.lower()
 
         # High confidence patterns (10-20 points)
@@ -216,10 +228,114 @@ class AnalyzerService:
         if url.count("/") >= 3 and not url.endswith("/"):
             score += 5
 
+        # Add random variation (0-5 points) to break deterministic ties
+        if add_randomness and score > -10:
+            score += random.uniform(0, 5)
+
         return score
 
+    def _filter_previously_selected(self, domain: str, candidates: list) -> list:
+        """Filter out URLs that were previously selected for this domain.
+        
+        Args:
+            domain: The website domain
+            candidates: List of (url, score) tuples
+            
+        Returns:
+            List of (url, score) tuples that haven't been selected before
+        """
+        if domain not in self._selected_urls_cache:
+            return candidates
+        
+        previously_selected = self._selected_urls_cache[domain]
+        new_candidates = [(url, score) for url, score in candidates if url not in previously_selected]
+        
+        if new_candidates and len(new_candidates) < len(candidates):
+            logger.info(f"[SELECTION] Filtered out {len(candidates) - len(new_candidates)} previously selected URLs")
+        
+        return new_candidates
+
+    def _mark_url_as_selected(self, domain: str, url: str):
+        """Mark a URL as selected for this domain to avoid repeating it.
+        
+        Args:
+            domain: The website domain
+            url: The selected URL
+        """
+        if domain not in self._selected_urls_cache:
+            self._selected_urls_cache[domain] = set()
+        
+        self._selected_urls_cache[domain].add(url)
+        
+        # Keep cache size bounded (FIFO-like behavior)
+        if len(self._selected_urls_cache[domain]) > self._max_cache_size_per_domain:
+            # Convert to list, remove oldest (first) item, convert back to set
+            cache_list = list(self._selected_urls_cache[domain])
+            self._selected_urls_cache[domain] = set(cache_list[1:])
+        
+        logger.debug(f"[SELECTION] Marked {url} as selected for {domain} (cache size: {len(self._selected_urls_cache[domain])})")
+
+    def _weighted_random_selection(self, scored_candidates: list, n: int) -> list:
+        """Select n URLs using weighted random selection based on scores.
+        
+        Higher-scored URLs have higher probability of selection, but lower-scored
+        ones still have a chance. This provides variety while maintaining quality.
+        
+        Args:
+            scored_candidates: List of (url, score) tuples sorted by score descending
+            n: Number of URLs to select
+            
+        Returns:
+            List of selected URLs
+        """
+        if not scored_candidates:
+            return []
+        
+        if len(scored_candidates) <= n:
+            return [url for url, _ in scored_candidates]
+        
+        # Extract URLs and scores
+        urls = [url for url, _ in scored_candidates]
+        scores = [score for _, score in scored_candidates]
+        
+        # Convert scores to weights (add constant to handle negative scores)
+        min_score = min(scores)
+        offset = abs(min_score) + 10 if min_score < 0 else 0
+        weights = [score + offset for score in scores]
+        
+        # Ensure all weights are positive
+        if any(w <= 0 for w in weights):
+            # Fallback to equal weights if something went wrong
+            weights = [1.0] * len(weights)
+        
+        # Use weighted random sampling without replacement
+        try:
+            selected_urls = random.choices(urls, weights=weights, k=min(n, len(urls)))
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_selected = []
+            for url in selected_urls:
+                if url not in seen:
+                    seen.add(url)
+                    unique_selected.append(url)
+            
+            # If we got duplicates, fill up with remaining candidates
+            if len(unique_selected) < n:
+                remaining = [u for u in urls if u not in seen]
+                if remaining:
+                    unique_selected.extend(remaining[:n - len(unique_selected)])
+            
+            return unique_selected
+        except Exception as e:
+            logger.warning(f"[SELECTION] Weighted selection failed: {e}, falling back to simple random")
+            return random.sample(urls, min(n, len(urls)))
+
     def _quick_filter_non_products(self, urls: list) -> list:
-        """Quickly filter out obvious non-product URLs before validation."""
+        """Quickly filter out obvious non-product URLs before validation.
+        
+        Returns:
+            List of (url, score) tuples sorted by score (highest first)
+        """
         filtered = []
         for url in urls:
             score = self._score_product_url(url)
@@ -228,7 +344,7 @@ class AnalyzerService:
 
         # Sort by score (highest first)
         filtered.sort(key=lambda x: x[1], reverse=True)
-        return [url for url, score in filtered]
+        return filtered  # Return tuples with scores for weighted selection
 
     async def _discover_category_urls(self, page, base_url: str) -> list:
         """
@@ -404,22 +520,37 @@ class AnalyzerService:
 
                 await page.close()
 
-                # STEP 4: Validate top candidates (randomly selected from top-scored for variety)
-                top_candidates = filtered_candidates[: min(10, len(filtered_candidates))]  # Top 10 by score
-                max_to_validate = min(settings.max_validation_attempts, len(top_candidates))
-                candidates_to_check = (
-                    random.sample(top_candidates, max_to_validate)
-                    if len(top_candidates) >= max_to_validate
-                    else top_candidates
-                )
+                # STEP 4: Validate top candidates with improved random selection
+                # Expand pool size for more variety (30-50 instead of 10)
+                pool_size = min(50, len(filtered_candidates))
+                top_candidates = filtered_candidates[:pool_size]
+                
+                # Get domain for URL history tracking
+                parsed = urlparse(url)
+                domain = parsed.netloc
+                
+                # Filter out previously selected URLs to ensure variety
+                new_candidates = self._filter_previously_selected(domain, top_candidates)
+                
+                # If all candidates were previously selected, use the original pool
+                if not new_candidates:
+                    logger.info(f"[SELECTION] All top candidates were previously selected, using full pool")
+                    new_candidates = top_candidates
+                
+                # Use weighted random selection (higher scores = higher probability)
+                max_to_validate = min(settings.max_validation_attempts, len(new_candidates))
+                candidates_to_check = self._weighted_random_selection(new_candidates, max_to_validate)
+                
                 logger.info(
-                    f"[VALIDATION] Randomly validating {max_to_validate} from top {len(top_candidates)} candidates..."
+                    f"[VALIDATION] Selected {len(candidates_to_check)} candidates from pool of {len(new_candidates)} (filtered from {pool_size} total)"
                 )
 
                 for idx, candidate_url in enumerate(candidates_to_check):
                     logger.info(f"[VALIDATION] Checking candidate {idx + 1}/{max_to_validate}: {candidate_url}")
                     if await self._is_valid_product_page(candidate_url):
                         logger.info(f" Discovered valid product URL: {candidate_url}")
+                        # Mark this URL as selected to avoid repeating it in future runs
+                        self._mark_url_as_selected(domain, candidate_url)
                         return candidate_url
 
                 logger.warning(f"No valid product pages found after validating {max_to_validate} candidates")
@@ -479,18 +610,22 @@ class AnalyzerService:
                             await cat_page.close()
 
                             if cat_candidates:
-                                # Filter and validate category candidates
+                                # Filter and validate category candidates using improved selection logic
                                 filtered_cat = self._quick_filter_non_products(cat_candidates)
                                 logger.info(f"[CATEGORY] Found {len(filtered_cat)} product candidates in category")
 
-                                # Randomly validate 3 from top candidates in this category
-                                top_cat_candidates = filtered_cat[: min(10, len(filtered_cat))]  # Top 10 by score
-                                num_to_validate = min(3, len(top_cat_candidates))
-                                cat_products_to_check = (
-                                    random.sample(top_cat_candidates, num_to_validate)
-                                    if len(top_cat_candidates) >= num_to_validate
-                                    else top_cat_candidates
-                                )
+                                # Use improved selection logic for category products too
+                                pool_size = min(30, len(filtered_cat))
+                                top_cat_candidates = filtered_cat[:pool_size]
+                                
+                                # Filter out previously selected URLs
+                                new_cat_candidates = self._filter_previously_selected(domain, top_cat_candidates)
+                                if not new_cat_candidates:
+                                    new_cat_candidates = top_cat_candidates
+                                
+                                # Use weighted random selection
+                                num_to_validate = min(3, len(new_cat_candidates))
+                                cat_products_to_check = self._weighted_random_selection(new_cat_candidates, num_to_validate)
 
                                 for prod_idx, candidate_url in enumerate(cat_products_to_check):
                                     logger.info(
@@ -498,6 +633,8 @@ class AnalyzerService:
                                     )
                                     if await self._is_valid_product_page(candidate_url):
                                         logger.info(f" Discovered product via category navigation: {candidate_url}")
+                                        # Mark this URL as selected
+                                        self._mark_url_as_selected(domain, candidate_url)
                                         return candidate_url
 
                         except Exception as e:
