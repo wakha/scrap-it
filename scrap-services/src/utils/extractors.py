@@ -93,6 +93,7 @@ class DataExtractor:
     def extract_delivery_time_with_regex(text: str) -> Optional[str]:
         """
         Extract delivery time information using regex.
+        Enhanced to handle more formats and edge cases.
 
         Args:
             text: Text containing delivery information
@@ -103,22 +104,46 @@ class DataExtractor:
         if not text:
             return None
 
+        text_lower = text.lower()
+
         # Pattern for delivery time (e.g., "2-3 days", "1-2 business days", "Next day")
         # Enhanced for Danish: "1-4 hverdage", "Få leveret fra i morgen", "Få leveret i dag"
         patterns = [
             # Danish phrases for today/tomorrow delivery
             (r"i\s+dag", "0 days"),  # "i dag" = today = 0 days
+            (r"samme\s+dag", "0 days"),  # "samme dag" = same day = 0 days
             (r"fra\s+i\s+morgen", "1 day"),  # "fra i morgen" = from tomorrow = 1 day
             (r"i\s+morgen", "1 day"),  # "i morgen" = tomorrow = 1 day
-            # Standard delivery patterns
-            (r"(\d+-\d+\s*hverdage?)", None),  # Danish: "1-4 hverdage"
-            (r"(\d+-\d+\s*arbejdsdage?)", None),  # Danish: "2-3 arbejdsdage"
-            (r"(\d+\s*hverdage?)", None),  # Danish: "3 hverdage"
-            (r"(\d+\s*arbejdsdage?)", None),  # Danish: "2 arbejdsdage"
-            (r"inden for\s+(\d+-\d+\s*hverdage?)", None),  # "inden for 1-4 hverdage"
-            (r"(\d+-?\d*\s*(business\s*)?days?)", None),  # English
-            (r"(next\s*day|samme\s*dag|næste\s*dag)", "1 day"),  # Same/next day
-            (r"(\d+\s*(timer|hours?))", None),  # Hours
+            (r"næste\s+dag", "1 day"),  # "næste dag" = next day = 1 day
+            
+            # Standard delivery time ranges
+            (r"(\d+[-–]\d+)\s*hverdage?", None),  # Danish: "1-4 hverdage"
+            (r"(\d+[-–]\d+)\s*arbejdsdage?", None),  # Danish: "2-3 arbejdsdage"
+            (r"(\d+)\s*hverdage?", None),  # Danish: "3 hverdage"
+            (r"(\d+)\s*arbejdsdage?", None),  # Danish: "2 arbejdsdage"
+            (r"(\d+[-–]\d+)\s*dage", None),  # Danish: "2-3 dage"
+            (r"(\d+)\s*dage", None),  # Danish: "3 dage"
+            
+            # With prepositions
+            (r"inden\s+for\s+(\d+[-–]\d+)\s*hverdage?", None),  # "inden for 1-4 hverdage"
+            (r"om\s+(\d+[-–]\d+)\s*hverdage?", None),  # "om 2-3 hverdage"
+            (r"på\s+(\d+[-–]\d+)\s*hverdage?", None),  # "på 1-2 hverdage"
+            (r"ca\.?\s*(\d+[-–]\d+)\s*hverdage?", None),  # "ca. 2-3 hverdage"
+            
+            # English patterns
+            (r"(\d+[-–]\d*)\s*(business\s*)?days?", None),  # English: "2-3 business days"
+            (r"within\s+(\d+[-–]\d+)\s*(business\s*)?days?", None),  # "within 2-3 days"
+            (r"in\s+(\d+[-–]\d+)\s*(business\s*)?days?", None),  # "in 2-3 days"
+            
+            # Special cases
+            (r"next\s*day", "1 day"),  # "next day"
+            (r"same\s*day", "0 days"),  # "same day"
+            (r"express", "1-2 days"),  # "express" usually means 1-2 days
+            (r"hurtig\s*levering", "1-2 days"),  # Danish: "hurtig levering" = fast delivery
+            
+            # Hours-based delivery
+            (r"(\d+[-–]\d+)\s*(timer|hours?)", None),  # "24-48 timer" or "24 hours"
+            (r"inden\s+(\d+)\s*(timer|hours?)", None),  # "inden 24 timer"
         ]
 
         for pattern_info in patterns:
@@ -127,11 +152,15 @@ class DataExtractor:
             else:
                 pattern, fixed_value = pattern_info, None
 
-            match = re.search(pattern, text, re.IGNORECASE)
+            match = re.search(pattern, text_lower, re.IGNORECASE)
             if match:
                 if fixed_value:
                     return fixed_value
-                return match.group(1).strip()
+                # Return the matched group, with some cleanup
+                matched = match.group(1).strip()
+                # Normalize dash characters
+                matched = matched.replace("–", "-")
+                return matched
 
         return None
 

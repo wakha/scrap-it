@@ -108,27 +108,7 @@ class ScraperService:
 
                 # Handle cookie consent banners that might hide add-to-cart buttons
                 logger.info("[COOKIE] Checking for and dismissing cookie consent banners...")
-
-                cookie_dismissed = False
-                for cookie_sel in settings.cookie_selectors:
-                    try:
-                        cookie_btn = await page.query_selector(cookie_sel)
-                        if cookie_btn:
-                            is_visible = await cookie_btn.is_visible()
-                            if is_visible:
-                                await cookie_btn.click()
-                                logger.info(f"[COOKIE] Dismissed cookie banner with: {cookie_sel}")
-                                cookie_dismissed = True
-                                break
-                    except Exception as e:
-                        logger.debug(f"[COOKIE] Failed to click {cookie_sel}: {e}")
-                        continue
-
-                if not cookie_dismissed:
-                    logger.debug("[COOKIE] No cookie banner found or already dismissed")
-
-                # Store cookie dismissal state for later use
-                self._cookie_dismissed = cookie_dismissed
+                await self._dismiss_cookie_banner_if_needed(page, context="INITIAL_PAGE")
 
                 # Extract product information
                 logger.info("Extracting product data...")
@@ -269,12 +249,14 @@ class ScraperService:
     async def _extract_price(self, soup: BeautifulSoup, page) -> tuple[Optional[float], Optional[str]]:
         """
         Extract product price and currency using multiple fallback strategies.
+        Prioritizes main product price and filters out related products, membership prices, etc.
 
         Tries in order:
-        1. WooCommerce-specific price elements
-        2. Elements with 'price' in class name
-        3. Schema.org structured data (JSON-LD)
-        4. Open Graph meta tags
+        1. Schema.org structured data (JSON-LD) - most reliable
+        2. Open Graph meta tags
+        3. WooCommerce-specific price elements (with filtering)
+        4. itemprop price attribute
+        5. Elements with 'price' in class name (with strict filtering)
 
         Args:
             soup: BeautifulSoup parsed HTML of product page
@@ -284,16 +266,49 @@ class ScraperService:
             Tuple of (price_float, currency_code) or (None, None) if not found
         """
         try:
-            # Strategy 1: WooCommerce specific price elements
-            price_elem = soup.select_one(".woocommerce-Price-amount.amount, .price ins .amount, .price .amount")
+            # Strategy 1: Schema.org JSON-LD structured data (most reliable)
+            json_ld_price = self._extract_price_from_json_ld(soup)
+            if json_ld_price:
+                logger.info("Used Schema.org JSON-LD for price")
+                return json_ld_price
+
+            # Strategy 2: meta og:price (second most reliable)
+            meta_price = soup.find("meta", property="og:price:amount")
+            if meta_price and meta_price.get("content"):
+                try:
+                    price = float(meta_price.get("content"))
+                    currency_meta = soup.find("meta", property="og:price:currency")
+                    currency = currency_meta.get("content") if currency_meta else "USD"
+                    logger.info("Used meta og:price")
+                    return price, currency
+                except ValueError:
+                    pass
+
+            # Strategy 3: itemprop price (structured data)
+            price_elem = soup.find(attrs={"itemprop": "price"})
             if price_elem:
+                price_text = price_elem.get_text(strip=True) or price_elem.get("content", "")
+                if self._is_valid_price_context(price_elem):
+                    price_tuple = self.data_extractor.extract_price_with_regex(price_text)
+                    if price_tuple:
+                        logger.info("Used itemprop price")
+                        return price_tuple
+
+            # Strategy 4: WooCommerce specific price elements (prioritize current price)
+            # First, try to find the current/active price (not old/strikethrough)
+            price_elem = soup.select_one(
+                ".woocommerce-Price-amount.amount:not(del .amount):not(.was .amount), "
+                ".price ins .amount, "
+                ".price .amount:not(del .amount)"
+            )
+            if price_elem and self._is_main_product_price(price_elem):
                 price_text = price_elem.get_text(strip=True)
                 price_tuple = self.data_extractor.extract_price_with_regex(price_text)
                 if price_tuple:
                     logger.info("Used WooCommerce price selector")
                     return price_tuple
 
-            # Strategy 2: WooCommerce variation price (often in select options or table)
+            # Strategy 5: WooCommerce variation price (often in select options or table)
             variation_prices = soup.select(".variations select option, .variations td")
             for elem in variation_prices:
                 text = elem.get_text(strip=True)
@@ -305,40 +320,173 @@ class ScraperService:
                         logger.info(f"Used WooCommerce variation price from: {text[:50]}")
                         return price_tuple
 
-            # Strategy 3: Price class (general)
-            price_elem = soup.find(class_=lambda x: x and "price" in x.lower() if x else False)
-            if price_elem:
+            # Strategy 6: Price class (general) with strict filtering
+            price_elems = soup.find_all(class_=lambda x: x and "price" in x.lower() if x else False)
+            for price_elem in price_elems:
+                # Skip if this looks like it's from a related/recommended product section
+                if not self._is_main_product_price(price_elem):
+                    continue
+                
+                # Skip if it's an old/comparison price
+                if not self._is_valid_price_context(price_elem):
+                    continue
+                
                 price_text = price_elem.get_text(strip=True)
                 price_tuple = self.data_extractor.extract_price_with_regex(price_text)
                 if price_tuple:
+                    logger.info("Used price class selector")
                     return price_tuple
-
-            # Strategy 4: itemprop price
-            price_elem = soup.find(attrs={"itemprop": "price"})
-            if price_elem:
-                price_text = price_elem.get_text(strip=True) or price_elem.get("content", "")
-                price_tuple = self.data_extractor.extract_price_with_regex(price_text)
-                if price_tuple:
-                    logger.info("Used fallback: itemprop price")
-                    return price_tuple
-
-            # Strategy 5: meta og:price
-            meta_price = soup.find("meta", property="og:price:amount")
-            if meta_price and meta_price.get("content"):
-                try:
-                    price = float(meta_price.get("content"))
-                    currency_meta = soup.find("meta", property="og:price:currency")
-                    currency = currency_meta.get("content") if currency_meta else "USD"
-                    logger.info("Used fallback: meta og:price")
-                    return price, currency
-                except ValueError:
-                    pass
 
             logger.warning("Could not extract price with any strategy")
             return None, None
         except Exception as e:
             logger.error(f"Error extracting price: {e}")
             return None, None
+
+    def _extract_price_from_json_ld(self, soup: BeautifulSoup) -> Optional[tuple[float, str]]:
+        """
+        Extract price from Schema.org JSON-LD structured data.
+        This is the most reliable source as it's intended for search engines.
+
+        Args:
+            soup: BeautifulSoup parsed HTML
+
+        Returns:
+            Tuple of (price, currency) or None
+        """
+        try:
+            import json
+            
+            # Find all JSON-LD script tags
+            json_ld_scripts = soup.find_all("script", type="application/ld+json")
+            
+            for script in json_ld_scripts:
+                try:
+                    data = json.loads(script.string)
+                    
+                    # Handle both single objects and arrays
+                    items = data if isinstance(data, list) else [data]
+                    
+                    for item in items:
+                        # Look for Product type
+                        if item.get("@type") in ["Product", "ProductModel"]:
+                            offers = item.get("offers")
+                            
+                            if offers:
+                                # Handle both single offer and array of offers
+                                offer_list = offers if isinstance(offers, list) else [offers]
+                                
+                                for offer in offer_list:
+                                    # Get price and currency
+                                    price_str = offer.get("price")
+                                    currency = offer.get("priceCurrency", "USD")
+                                    
+                                    if price_str:
+                                        try:
+                                            price = float(price_str)
+                                            return price, currency
+                                        except (ValueError, TypeError):
+                                            continue
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+            
+            return None
+        except Exception as e:
+            logger.debug(f"Error extracting JSON-LD price: {e}")
+            return None
+
+    def _is_main_product_price(self, element) -> bool:
+        """
+        Check if a price element belongs to the main product, not a related/recommended product.
+        
+        Args:
+            element: BeautifulSoup element containing price
+            
+        Returns:
+            True if this is likely the main product price, False otherwise
+        """
+        # Check parent containers for indicators of related/recommended products
+        parent_text = ""
+        parent = element.parent
+        
+        # Walk up the DOM tree checking for related product indicators
+        for _ in range(5):  # Check up to 5 levels up
+            if not parent:
+                break
+                
+            parent_class = " ".join(parent.get("class", [])).lower()
+            parent_id = parent.get("id", "").lower()
+            parent_text = (parent_class + " " + parent_id).lower()
+            
+            # Exclude if in related/recommended products section
+            excluded_keywords = [
+                "related", "recommend", "similar", "also-bought", "you-may",
+                "cross-sell", "upsell", "bundle", "accessories",
+                "recently-viewed", "popular", "trending", "bestseller",
+                "widget", "sidebar", "aside"
+            ]
+            
+            if any(keyword in parent_text for keyword in excluded_keywords):
+                logger.debug(f"Skipping price from related products section: {parent_text[:50]}")
+                return False
+            
+            parent = parent.parent
+        
+        return True
+
+    def _is_valid_price_context(self, element) -> bool:
+        """
+        Check if a price element represents the actual current price,
+        not a membership price, old price, or comparison price.
+        
+        Args:
+            element: BeautifulSoup element containing price
+            
+        Returns:
+            True if this is a valid current price, False otherwise
+        """
+        # Check the element and its immediate parents for indicators
+        check_elements = [element]
+        parent = element.parent
+        for _ in range(3):  # Check element + 3 parent levels
+            if parent:
+                check_elements.append(parent)
+                parent = parent.parent
+        
+        for elem in check_elements:
+            elem_class = " ".join(elem.get("class", [])).lower()
+            elem_text = elem.get_text(strip=True).lower()
+            
+            # Exclude old/strikethrough prices
+            if elem.name in ["del", "s", "strike"]:
+                logger.debug("Skipping strikethrough/deleted price")
+                return False
+            
+            # Exclude based on class names
+            excluded_class_keywords = [
+                "old", "was", "before", "original", "regular", "compare",
+                "msrp", "rrp", "list-price", "crossed", "strike",
+                "member", "membership", "subscription", "subscribe",
+                "discount", "save", "you-save"
+            ]
+            
+            if any(keyword in elem_class for keyword in excluded_class_keywords):
+                logger.debug(f"Skipping price with excluded class: {elem_class[:50]}")
+                return False
+            
+            # Exclude based on surrounding text context (check only immediate element text)
+            if elem == element:
+                excluded_text_keywords = [
+                    "was", "before", "originally", "regular",
+                    "member", "membership", "subscribe", "subscription",
+                    "msrp", "rrp", "list price", "compare at"
+                ]
+                
+                if any(keyword in elem_text for keyword in excluded_text_keywords):
+                    logger.debug(f"Skipping price with excluded context: {elem_text[:50]}")
+                    return False
+        
+        return True
 
     async def _extract_description(self, soup: BeautifulSoup) -> Optional[str]:
         """
@@ -484,6 +632,9 @@ class ScraperService:
 
             if expanded_count > 0:
                 logger.info(f"[CHECKOUT] Expanded {expanded_count} shipping sections")
+                # Check for cookie popups after expanding sections
+                await asyncio.sleep(0.3)
+                await self._dismiss_cookie_banner_if_needed(page, context="EXPAND_SHIPPING")
             else:
                 logger.info("[CHECKOUT] No expandable sections found or all already expanded")
 
@@ -675,6 +826,9 @@ class ScraperService:
 
                     # After clicking next, check if shipping prices are now visible
                     await asyncio.sleep(settings.page_update_wait)  # Wait for page to update
+                    
+                    # Check for cookie popups after navigation to new step
+                    await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_STEP")
                     html = await page.content()
                     import re
 
@@ -719,13 +873,21 @@ class ScraperService:
         except Exception as e:
             logger.warning(f"[CHECKOUT] Error filling checkout details: {e}")
 
-    async def _dismiss_cookie_banner_if_needed(self, page) -> bool:
-        """Dismiss cookie consent banner if present and not already dismissed."""
-        if hasattr(self, "_cookie_dismissed") and self._cookie_dismissed:
-            logger.info("[CART] Cookie banner already dismissed during page load, skipping...")
-            return True
-
-        logger.info("[CART] Checking for cookie consent banner...")
+    async def _dismiss_cookie_banner_if_needed(self, page, context: str = "PAGE") -> bool:
+        """Dismiss cookie consent banner if present. Checks dynamically on every call.
+        
+        Args:
+            page: Playwright page object
+            context: Context string for logging (e.g., 'PAGE', 'CART', 'CHECKOUT')
+            
+        Returns:
+            True if cookie banner was dismissed, False otherwise
+        """
+        logger.debug(f"[{context}] Checking for cookie consent banner...")
+        
+        # Wait briefly for any dynamic cookie popups to appear
+        await asyncio.sleep(0.5)
+        
         for cookie_sel in settings.cookie_selectors:
             try:
                 cookie_btn = await page.query_selector(cookie_sel)
@@ -733,13 +895,14 @@ class ScraperService:
                     is_visible = await cookie_btn.is_visible()
                     if is_visible:
                         await cookie_btn.click(timeout=1000)
-                        logger.info(f"[CART] Dismissed cookie banner: {cookie_sel}")
+                        logger.info(f"[{context}] ✓ Dismissed cookie banner: {cookie_sel}")
+                        await asyncio.sleep(0.3)  # Brief wait after dismissal
                         return True
             except Exception as e:
-                logger.debug(f"[CART] Cookie selector {cookie_sel} failed: {e}")
+                logger.debug(f"[{context}] Cookie selector {cookie_sel} failed: {e}")
                 continue
 
-        logger.info("[CART] No cookie banner found or already dismissed")
+        logger.debug(f"[{context}] No cookie banner found")
         return False
 
     async def _select_product_variant_if_needed(self, page) -> bool:
@@ -763,18 +926,26 @@ class ScraperService:
                             if tag_name == "select":
                                 await element.select_option(index=1)
                                 logger.info(f"[CART] Selected variant from visible dropdown (option 1)")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                             elif tag_name in ["button", "a"] and not is_disabled:
                                 await element.click()
                                 logger.info(f"[CART] Clicked visible variant {tag_name} #{i}")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                             elif tag_name == "label":
                                 await element.click()
                                 logger.info(f"[CART] Clicked variant label #{i}")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                             elif tag_name == "input" and not is_disabled:
                                 await element.click()
                                 logger.info(f"[CART] Clicked variant input #{i}")
+                                await asyncio.sleep(0.3)  # Brief wait after variant selection
+                                await self._dismiss_cookie_banner_if_needed(page, context="VARIANT_SELECT")
                                 return True
                         except Exception as e:
                             logger.debug(f"[CART] Failed to select variant #{i}: {e}")
@@ -879,6 +1050,12 @@ class ScraperService:
 
             # Wait for cart to update
             await asyncio.sleep(settings.cart_modal_wait)
+            
+            # Check for cookie popups after add-to-cart action (might appear in modal)
+            await self._dismiss_cookie_banner_if_needed(page, context="ADD_TO_CART")
+            
+            # Check for cookie popups after add-to-cart action (might appear in modal)
+            await self._dismiss_cookie_banner_if_needed(page, context="ADD_TO_CART")
 
             # Validate using JavaScript
             cart_state = await page.evaluate(
@@ -1005,6 +1182,10 @@ class ScraperService:
                     logger.info(f"[CART] Attempting to navigate directly to: {checkout_url}")
                     await page.goto(checkout_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout)
                     await asyncio.sleep(settings.page_update_wait)
+                    
+                    # Check for cookie popups after navigation
+                    await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_NAV")
+                    
                     current = page.url.lower()
                     if any(keyword in current for keyword in ["/checkout", "/kassen", "/levering"]):
                         logger.info(f"[CART] Successfully navigated to checkout: {page.url}")
@@ -1020,6 +1201,10 @@ class ScraperService:
                     logger.info(f"[CART] Attempting to navigate to cart: {cart_url}")
                     await page.goto(cart_url, wait_until="domcontentloaded", timeout=settings.navigation_timeout)
                     await asyncio.sleep(settings.page_update_wait)
+                    
+                    # Check for cookie popups after navigation
+                    await self._dismiss_cookie_banner_if_needed(page, context="CART_PAGE")
+                    
                     current = page.url.lower()
                     if any(keyword in current for keyword in ["/cart", "/kurv"]):
                         logger.info(f"[CART] Successfully navigated to cart: {page.url}")
@@ -1044,7 +1229,7 @@ class ScraperService:
             logger.info("[CART] Attempting to extract shipping from cart/checkout...")
 
             # Step 1: Dismiss cookie banner if needed
-            await self._dismiss_cookie_banner_if_needed(page)
+            await self._dismiss_cookie_banner_if_needed(page, context="CART")
 
             # Step 2: Select product variant if needed
             variant_selected = await self._select_product_variant_if_needed(page)
@@ -1130,6 +1315,9 @@ class ScraperService:
                     await asyncio.sleep(settings.page_update_wait)
                     checkout_success = True
                     logger.info(f"[CART] Successfully navigated to: {page.url}")
+                    
+                    # Check for cookie popups after navigation
+                    await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_NAV")
 
                     # Now we're on the checkout page with the added item in basket
                     # Proceed directly to fill checkout details
@@ -1157,6 +1345,10 @@ class ScraperService:
                                 await checkout_button.click()
                                 await asyncio.sleep(settings.checkout_step_wait)
                                 logger.info(f"[CART] Clicked checkout button, now at: {page.url}")
+                                
+                                # Check for cookie popups after clicking checkout button
+                                await self._dismiss_cookie_banner_if_needed(page, context="CHECKOUT_BUTTON")
+                                
                                 # Fill checkout details after navigating
                                 await self._fill_checkout_details_if_needed(page)
                                 checkout_success = True
@@ -1193,14 +1385,14 @@ class ScraperService:
                     "class": lambda x: x
                     and any(
                         k in " ".join(x).lower()
-                        for k in ["shipping-option", "delivery-option", "shipping-card", "delivery-method"]
+                        for k in ["shipping-option", "delivery-option", "shipping-card", "delivery-method", "shipping-rate"]
                     )
                 },
                 {"class": lambda x: x and "radio" in " ".join(x).lower() and "label" in " ".join(x).lower()},
             ]
 
             for selector in card_selectors:
-                cards = cart_soup.find_all(["div", "li", "label"], attrs=selector)
+                cards = cart_soup.find_all(["div", "li", "label", "tr"], attrs=selector)
                 shipping_sections.extend(cards)
 
             # Strategy 2: Find shipping method radio buttons and their labels
@@ -1208,7 +1400,7 @@ class ScraperService:
                 "input",
                 attrs={
                     "type": "radio",
-                    "name": lambda x: x and ("shipping" in x.lower() or "levering" in x.lower()) if x else False,
+                    "name": lambda x: x and ("shipping" in x.lower() or "levering" in x.lower() or "delivery" in x.lower()) if x else False,
                 },
             )
             for radio in shipping_radios:
@@ -1218,8 +1410,8 @@ class ScraperService:
                     label = cart_soup.find("label", attrs={"for": radio_id})
                     if label:
                         shipping_sections.append(label)
-                # Also check parent container (but only immediate parent, not grandparent)
-                if radio.parent and radio.parent.name in ["div", "li", "label"]:
+                # Also check parent container (but only immediate parent)
+                if radio.parent and radio.parent.name in ["div", "li", "label", "td"]:
                     shipping_sections.append(radio.parent)
 
             # Strategy 3: Find by class/id keywords (but filter out large containers)
@@ -1231,14 +1423,26 @@ class ScraperService:
                 "fragt",
                 "shipping_method",
                 "shipping-method",
+                "delivery-method",
+                "leveringsmetode",
             ]:
                 sections = cart_soup.find_all(class_=lambda x: x and keyword in x.lower() if x else False)
                 # Filter: only add if the section is relatively small (not a large container)
                 for section in sections:
                     text_len = len(section.get_text(strip=True))
                     # Skip if text is too long (likely a container) or too short
-                    if 20 < text_len < 500:
+                    if 20 < text_len < 800:  # Increased max to capture more complete shipping info
                         shipping_sections.append(section)
+
+            # Strategy 4: Find table rows that contain shipping information
+            # Many checkout pages use tables to display shipping options
+            table_rows = cart_soup.find_all("tr")
+            for row in table_rows:
+                row_text = row.get_text(strip=True).lower()
+                if any(keyword in row_text for keyword in ["shipping", "levering", "forsendelse", "delivery", "fragt"]):
+                    # Make sure it's not a header row
+                    if not row.find("th"):
+                        shipping_sections.append(row)
 
             # Remove duplicates while preserving order
             seen = set()
@@ -1251,10 +1455,24 @@ class ScraperService:
             shipping_sections = unique_sections
 
             logger.info(f"[CART] Found {len(shipping_sections)} potential shipping sections")
+            
+            # Debug: Log sample of what we found to help diagnose issues
+            if shipping_sections:
+                logger.info(f"[CART] Sample of shipping sections found:")
+                for idx, section in enumerate(shipping_sections[:3]):
+                    sample_text = section.get_text(strip=True)[:150]
+                    logger.info(f"  Section {idx + 1}: {sample_text}...")
+            else:
+                logger.warning(f"[CART] WARNING: No shipping sections found!")
+                logger.warning(f"[CART] This could mean:")
+                logger.warning(f"  1. Checkout page doesn't have shipping options visible")
+                logger.warning(f"  2. Need to expand collapsed sections or complete more checkout steps")
+                logger.warning(f"  3. Selectors need adjustment for this specific site")
+                logger.info(f"[CART] Current page URL: {page.url}")
 
             # Extract shipping providers from checkout sections
             seen_providers = set()
-            for section in shipping_sections[:10]:
+            for section in shipping_sections:
                 text = section.get_text(separator=" ", strip=True)
                 text_lower = text.lower()
 
@@ -1280,6 +1498,11 @@ class ScraperService:
                 ]
                 if any(keyword in text_lower for keyword in skip_keywords):
                     logger.info(f"[CART] Skipping - appears to be product variation, not shipping")
+                    continue
+
+                # Skip if this looks like it's not shipping-related at all
+                if not self._is_shipping_related(text_lower):
+                    logger.debug(f"[CART] Skipping - not shipping-related")
                     continue
 
                 # Extract provider name with multiple strategies
@@ -1352,30 +1575,8 @@ class ScraperService:
                                 logger.info(f"[CART] Extracted provider from pattern: {provider_name}")
                                 break
 
-                # Extract price - look for "Fra X kr" or "X kr" patterns
-                cost = None
-                currency = "DKK"
-
-                # Check for "Fra X kr" (from X kr) - minimum price
-                import re
-
-                fra_match = re.search(r"fra\s+(\d+[.,]?\d*)\s*kr", text_lower)
-                if fra_match:
-                    cost = float(fra_match.group(1).replace(",", "."))
-                    currency = "DKK"
-                    logger.info(f"[CART] Found minimum shipping price: Fra {cost} {currency}")
-                else:
-                    # Try standard price extraction
-                    price_match = self.data_extractor.extract_price_with_regex(text)
-                    if price_match:
-                        cost, currency = price_match
-                        logger.info(f"[CART] Found shipping price: {cost} {currency}")
-
-                # Check for free shipping
-                is_free = any(word in text_lower for word in ["gratis", "free", "fri"])
-                if is_free and cost is None:
-                    cost = 0.0
-                    logger.info(f"[CART] Free shipping option found")
+                # Extract price - use improved method that filters out non-shipping costs
+                cost, currency = self._extract_shipping_cost_from_text(text, text_lower)
 
                 # Extract delivery time
                 delivery_time = self.data_extractor.extract_delivery_time_with_regex(text)
@@ -1383,13 +1584,15 @@ class ScraperService:
                 # Classify delivery type based on text content
                 delivery_type = self._classify_delivery_type(text_lower)
 
-                # Only add if we have meaningful info
-                if provider_name or cost is not None or is_free:
-                    final_name = provider_name or ("Free Shipping" if is_free else "Standard Shipping")
+                # Only add if we have actual price information (including 0.0 for free shipping)
+                # Don't add providers without price info - they're incomplete
+                if cost is not None:
+                    final_name = provider_name or ("Free Shipping" if cost == 0.0 else "Standard Shipping")
 
-                    # Deduplicate
+                    # Deduplicate based on name, cost, and delivery type (not delivery_time to avoid splitting same option)
                     provider_key = f"{final_name}_{cost}_{delivery_type}"
                     if provider_key in seen_providers:
+                        logger.debug(f"[CART] Skipping duplicate provider: {provider_key}")
                         continue
                     seen_providers.add(provider_key)
 
@@ -1397,20 +1600,35 @@ class ScraperService:
                         ShippingProvider(
                             name=final_name,
                             price=cost,
-                            currency=currency if cost is not None else None,
+                            currency=currency,
                             delivery_time=delivery_time or "Unknown",
                             delivery_type=delivery_type,
                             description=text[:200] if len(text) > 200 else text,
                         )
                     )
                     logger.info(
-                        f"[CART] Extracted shipping: {final_name}, {cost} {currency if cost else 'TBD'}, Type: {delivery_type}"
+                        f"[CART] Extracted shipping: {final_name}, {cost} {currency if cost is not None else 'TBD'}, Time: {delivery_time or 'Unknown'}, Type: {delivery_type}"
                     )
+                else:
+                    # Skip providers without price - they're incomplete information
+                    if provider_name:
+                        logger.debug(f"[CART] Skipping {provider_name} - no price information found")
 
             if providers:
                 logger.info(f"[CART] Successfully extracted {len(providers)} shipping provider(s) from cart/checkout")
+                # Log what we're actually returning
+                logger.info(f"[CART] Final provider list being returned:")
+                for idx, p in enumerate(providers, 1):
+                    logger.info(f"  {idx}. {p.name}: {p.price} {p.currency}, {p.delivery_time}, {p.delivery_type}")
             else:
-                logger.info("[CART] No shipping providers found in cart/checkout")
+                logger.warning("[CART] No shipping providers found in cart/checkout")
+                logger.info("[CART] Attempting fallback: searching entire page for shipping info...")
+                
+                # Fallback: Search entire page more broadly
+                fallback_providers = await self._extract_shipping_fallback(page, cart_soup)
+                if fallback_providers:
+                    providers.extend(fallback_providers)
+                    logger.info(f"[CART] Fallback found {len(fallback_providers)} provider(s)")
 
         except Exception as e:
             logger.warning(f"[CART] Error extracting shipping from cart: {e}")
@@ -1418,8 +1636,328 @@ class ScraperService:
 
         return providers
 
+    async def _extract_shipping_fallback(self, page, soup: BeautifulSoup) -> List[ShippingProvider]:
+        """
+        Fallback method to extract shipping when standard methods fail.
+        Uses more aggressive text searching across the entire page.
+        
+        Args:
+            page: Playwright page object
+            soup: BeautifulSoup of page content
+            
+        Returns:
+            List of ShippingProvider objects
+        """
+        providers = []
+        seen_providers = set()
+        
+        try:
+            logger.info("[CART FALLBACK] Searching entire page for shipping information...")
+            
+            # Strategy: Find all text containing shipping-related keywords
+            all_text_elements = soup.find_all(text=lambda t: t and len(t.strip()) > 10)
+            
+            shipping_texts = []
+            for text_elem in all_text_elements:
+                text = text_elem.strip()
+                text_lower = text.lower()
+                
+                # Check if contains shipping keywords
+                if any(k in text_lower for k in ["levering", "delivery", "shipping", "forsendelse", "fragt"]):
+                    # Also has a price or provider name
+                    has_price = any(c.isdigit() for c in text)
+                    has_provider = any(p in text_lower for p in ["gls", "postnord", "dao", "bring", "dhl"])
+                    
+                    if has_price or has_provider:
+                        parent = text_elem.parent
+                        if parent and parent.name not in ["script", "style"]:
+                            # Get parent context
+                            context = parent.get_text(strip=True)
+                            if len(context) < 500:  # Not too large
+                                shipping_texts.append(context)
+            
+            # Deduplicate
+            unique_texts = list(set(shipping_texts))
+            logger.info(f"[CART FALLBACK] Found {len(unique_texts)} unique text segments with shipping info")
+            
+            # Extract from each unique text
+            for text in unique_texts[:20]:  # Limit to prevent too many
+                text_lower = text.lower()
+                
+                if not self._is_shipping_related(text_lower):
+                    continue
+                
+                # Extract provider name
+                provider_name = None
+                known_providers = {
+                    "burd express": "Burd Express",
+                    "post nord": "PostNord",
+                    "postnord": "PostNord",
+                    "pakkeshop": "PostNord Pakkeshop",
+                    "pakkeboks": "PostNord Pakkeboks",
+                    "gls": "GLS",
+                    "dao": "DAO",
+                    "bring": "Bring",
+                    "burd": "Burd",
+                    "dhl": "DHL",
+                    "ups": "UPS",
+                    "fedex": "FedEx",
+                }
+                
+                import re
+                for keyword, name in known_providers.items():
+                    pattern = r"\b" + re.escape(keyword) + r"\b"
+                    if re.search(pattern, text_lower, re.IGNORECASE):
+                        provider_name = name
+                        break
+                
+                # Extract cost and delivery time
+                cost, currency = self._extract_shipping_cost_from_text(text, text_lower)
+                delivery_time = self.data_extractor.extract_delivery_time_with_regex(text)
+                delivery_type = self._classify_delivery_type(text_lower)
+                
+                # Add if we have something useful
+                if provider_name or cost is not None:
+                    final_name = provider_name or ("Free Shipping" if cost == 0.0 else "Standard Shipping")
+                    
+                    provider_key = f"{final_name}_{cost}_{delivery_time}_{delivery_type}"
+                    if provider_key not in seen_providers:
+                        seen_providers.add(provider_key)
+                        
+                        providers.append(
+                            ShippingProvider(
+                                name=final_name,
+                                price=cost,
+                                currency=currency if cost is not None else None,
+                                delivery_time=delivery_time or "Unknown",
+                                delivery_type=delivery_type,
+                                description=text[:200] if len(text) > 200 else text,
+                            )
+                        )
+                        logger.info(f"[CART FALLBACK] Extracted: {final_name}, {cost} {currency if cost else 'TBD'}")
+            
+            return providers
+            
+        except Exception as e:
+            logger.warning(f"[CART FALLBACK] Error in fallback extraction: {e}")
+            return []
+
+    def _is_shipping_related(self, text_lower: str) -> bool:
+        """
+        Check if text is actually related to shipping/delivery.
+        
+        Args:
+            text_lower: Lowercase text to check
+            
+        Returns:
+            True if shipping-related, False otherwise
+        """
+        shipping_indicators = [
+            "shipping", "delivery", "levering", "forsendelse", "fragt",
+            "postnord", "gls", "dao", "dhl", "ups", "fedex", "bring",
+            "pakkeshop", "pakkeboks", "hjemlevering", "home delivery",
+            "express", "standard", "gratis", "free"
+        ]
+        
+        return any(indicator in text_lower for indicator in shipping_indicators)
+
+    def _extract_shipping_cost_from_text(self, text: str, text_lower: str) -> tuple[Optional[float], Optional[str]]:
+        """
+        Extract shipping cost from text, filtering out non-shipping costs.
+        
+        Filters out:
+        - Product prices (usually higher than shipping)
+        - Tax amounts
+        - Order totals
+        - Minimum order values
+        - Delivery time numbers (e.g., "2-4 days")
+        
+        Args:
+            text: Original text
+            text_lower: Lowercase version of text
+            
+        Returns:
+            Tuple of (cost, currency) or (None, None)
+        """
+        import re
+        
+        # Check for free shipping first
+        is_free = any(word in text_lower for word in ["gratis", "free", "fri levering", "fri fragt"])
+        if is_free:
+            logger.info(f"[CART] Free shipping detected")
+            return 0.0, "DKK"
+        
+        # IMPORTANT: Check if this text is primarily about delivery time, not price
+        # This prevents extracting "2" from "2-4 arbejdsdage" as a price
+        delivery_time_only_patterns = [
+            r"leveringstiden\s+tager\s+normalt\s+\d+[-–]\d+\s+(?:arbejdsdage|hverdage|dage)",  # "leveringstiden tager normalt 2-4 arbejdsdage"
+            r"^\s*\d+[-–]\d+\s+(?:arbejdsdage|hverdage|dage|business\s*days?|days?)\s*$",  # Just "2-4 arbejdsdage"
+            r"leveres\s+(?:inden\s+)?(?:for\s+)?\d+[-–]\d+\s+(?:arbejdsdage|hverdage|dage)",  # "leveres inden 2-4 dage"
+        ]
+        
+        for pattern in delivery_time_only_patterns:
+            if re.search(pattern, text_lower):
+                # Check if there's also a price in the text (like "...2-4 arbejdsdage. 79 kr")
+                # If yes, don't skip - extract the price
+                if re.search(r"\d+\s*kr", text_lower):
+                    logger.info(f"[CART] Text has delivery time AND price, will try to extract price")
+                    break  # Don't return None, continue to price extraction
+                else:
+                    logger.debug(f"[CART] Text is about delivery time only, not price: {text[:50]}")
+                    return None, None
+        
+        # Check for "Fra X kr" (from X kr) - minimum price
+        fra_match = re.search(r"fra\s+(\d+[.,]?\d*)\s*kr", text_lower)
+        if fra_match:
+            cost = float(fra_match.group(1).replace(",", "."))
+            logger.info(f"[CART] Found minimum shipping price: Fra {cost} DKK")
+            return cost, "DKK"
+        
+        # Extract all prices from the text
+        all_prices = []
+        
+        # Pattern 1: Look for explicit shipping price indicators
+        explicit_patterns = [
+            r"(?:shipping|levering|forsendelse|fragt)[:\s]+(\d+[.,]?\d*)\s*(?:kr|dkk)",
+            r"(\d+[.,]?\d*)\s*(?:kr|dkk)\s*(?:shipping|levering|forsendelse|fragt)",
+            r"(?:pris|price|cost)[:\s]+(\d+[.,]?\d*)\s*(?:kr|dkk)",
+        ]
+        
+        for pattern in explicit_patterns:
+            matches = re.finditer(pattern, text_lower)
+            for match in matches:
+                try:
+                    price = float(match.group(1).replace(",", "."))
+                    all_prices.append((price, "DKK", "explicit"))
+                    logger.debug(f"[CART] Found explicit shipping price: {price} DKK")
+                except (ValueError, IndexError):
+                    continue
+        
+        # If we found explicit shipping prices, use the first one
+        if all_prices:
+            cost, currency, _ = all_prices[0]
+            return cost, currency
+        
+        # Pattern 2: Look for standalone price (e.g., "59 kr") BUT ensure it's not part of delivery time
+        # Ensure the number is followed by "kr" or currency, not by "arbejdsdage" or similar
+        standalone_price_pattern = r"(\d+[.,]?\d*)\s*(?:kr|dkk)(?!\s*[-–]|\s*arbejdsdage|\s*hverdage|\s*dage|\s*days)"
+        matches = list(re.finditer(standalone_price_pattern, text_lower))
+        
+        logger.debug(f"[CART] Standalone price pattern found {len(matches)} matches in text: {text[:100]}")
+        
+        if matches:
+            # Get all potential prices
+            potential_prices = []
+            for match in matches:
+                try:
+                    price = float(match.group(1).replace(",", "."))
+                    
+                    # Check the context BEFORE the price (not after) - this is key!
+                    # If "arbejdsdage" etc. appears BEFORE the price number, it might be delivery time
+                    # But if it appears after (like "2-4 arbejdsdage. 79 kr"), the price is separate
+                    start = max(0, match.start() - 15)  # Reduced from 30 to 15
+                    before_context = text_lower[start:match.start()]
+                    
+                    logger.debug(f"[CART] Checking price {price}, before_context: '{before_context}'")
+                    
+                    # Skip only if the number itself is part of a delivery time range (e.g., "2-4")
+                    # Check if there's a dash right before our number
+                    if re.search(r"\d+\s*[-–]\s*$", before_context):
+                        logger.debug(f"[CART] Skipping {price} - part of range like '2-4'")
+                        continue
+                    
+                    # Skip if this looks like "2 kr arbejdsdage" (price directly followed by time unit)
+                    after_start = match.end()
+                    after_end = min(len(text_lower), match.end() + 20)
+                    after_context = text_lower[after_start:after_end]
+                    
+                    if re.match(r"^\s*[-–]?\s*\d+\s*(?:arbejdsdage|hverdage|dage|days)", after_context):
+                        logger.debug(f"[CART] Skipping {price} - followed by delivery time")
+                        continue
+                    
+                    potential_prices.append(price)
+                except (ValueError, IndexError):
+                    continue
+            
+            logger.debug(f"[CART] After filtering, {len(potential_prices)} potential prices remain")
+            
+            # Use the first valid price found
+            if potential_prices:
+                cost = potential_prices[0]
+                if self._is_valid_shipping_cost(cost, text_lower):
+                    logger.info(f"[CART] Found shipping price: {cost} DKK")
+                    return cost, "DKK"
+                else:
+                    logger.debug(f"[CART] Price {cost} failed validation")
+        
+        # Pattern 3: Try standard price extraction but validate more strictly
+        price_match = self.data_extractor.extract_price_with_regex(text)
+        if price_match:
+            cost, currency = price_match
+            
+            # Additional validation: check if the price appears near delivery time indicators
+            # Find the position of the price in the text
+            price_str = str(int(cost)) if cost == int(cost) else str(cost).replace(".", ",")
+            price_pos = text_lower.find(price_str)
+            
+            if price_pos >= 0:
+                # Check 50 chars before and after
+                context_start = max(0, price_pos - 50)
+                context_end = min(len(text_lower), price_pos + 50)
+                context = text_lower[context_start:context_end]
+                
+                # If delivery time keywords are very close to the number, it's likely delivery time
+                if re.search(r"\d+[-–]\d+\s*(?:arbejdsdage|hverdage|dage|days)", context):
+                    logger.debug(f"[CART] Rejected {cost} - too close to delivery time indicators")
+                    return None, None
+            
+            # Validate: shipping costs are typically between 0 and 200 DKK
+            if self._is_valid_shipping_cost(cost, text_lower):
+                logger.info(f"[CART] Found shipping price: {cost} {currency}")
+                return cost, currency
+            else:
+                logger.debug(f"[CART] Rejected price {cost} - doesn't appear to be shipping cost")
+                return None, None
+        
+        return None, None
+
+    def _is_valid_shipping_cost(self, cost: float, text_lower: str) -> bool:
+        """
+        Validate if a price is likely a shipping cost.
+        
+        Args:
+            cost: The price amount
+            text_lower: Lowercase text context
+            
+        Returns:
+            True if likely a shipping cost, False otherwise
+        """
+        # Shipping costs are typically between 0 and 200 DKK in Denmark
+        # Anything outside this range is likely not shipping
+        if cost < 0 or cost > 250:
+            logger.debug(f"[CART] Cost {cost} outside normal shipping range")
+            return False
+        
+        # Exclude if text mentions these non-shipping indicators
+        exclude_indicators = [
+            "total", "sum", "subtotal", "i alt", "beløb",
+            "minimum", "mindste", "køb for",  # minimum order value
+            "moms", "tax", "vat", "skat",  # tax
+            "rabat", "discount", "besparelse",  # discount
+            "product", "produkt", "vare",  # product price
+        ]
+        
+        if any(indicator in text_lower for indicator in exclude_indicators):
+            logger.debug(f"[CART] Text contains non-shipping indicator")
+            return False
+        
+        return True
+
     async def _extract_shipping_providers(self, soup: BeautifulSoup) -> List[ShippingProvider]:
-        """Extract shipping provider information from page"""
+        """
+        Extract shipping provider information from product page.
+        Uses improved logic to find all shipping options and filter out non-shipping costs.
+        """
         providers = []
         try:
             # Common shipping provider keywords
@@ -1463,35 +2001,49 @@ class ScraperService:
             # Deduplicate sections
             unique_sections = []
             seen_texts = set()
-            for section in shipping_sections[:10]:  # Check more sections
+            for section in shipping_sections:
                 text = section.get_text(strip=True)
-                if text and text not in seen_texts:
+                if text and text not in seen_texts and len(text) > 10:  # Skip very short text
                     unique_sections.append(section)
                     seen_texts.add(text)
 
-            # Look for shipping info in text
-            for section in unique_sections[:5]:  # Limit to first 5 unique sections
+            logger.info(f"[SHIPPING] Found {len(unique_sections)} unique shipping sections on page")
+
+            # Track seen providers to avoid duplicates
+            seen_providers = set()
+
+            # Look for shipping info in text - analyze ALL unique sections, not just first 5
+            for idx, section in enumerate(unique_sections):
                 text = section.get_text(strip=True)
                 text_lower = text.lower()
 
-                logger.info(f"[SHIPPING] Analyzing: {text[:150]}...")
+                logger.info(f"[SHIPPING] Analyzing section {idx + 1}/{len(unique_sections)}: {text[:150]}...")
 
                 # Check if this section actually contains useful shipping info
-                has_shipping_info = any(k in text_lower for k in shipping_keywords)
-                if not has_shipping_info:
+                if not self._is_shipping_related(text_lower):
+                    logger.debug(f"[SHIPPING] Skipping - not shipping-related")
+                    continue
+
+                # Skip if text is too long (likely a large container with multiple items)
+                if len(text) > 1000:
+                    logger.debug(f"[SHIPPING] Skipping - text too long ({len(text)} chars), likely container")
                     continue
 
                 # Extract provider name with multiple strategies
                 provider_name = None
+                providers_list = []
 
-                # Strategy 1: Check for known provider keywords (page extraction)
+                # Strategy 1: Check for known provider keywords
                 known_providers = {
-                    "postnord": "PostNord",
+                    "burd express": "Burd Express",
                     "post nord": "PostNord",
-                    "pakkeshop": "PostNord",  # PostNord Pakkeshop
+                    "postnord": "PostNord",
+                    "pakkeshop": "PostNord Pakkeshop",
+                    "pakkeboks": "PostNord Pakkeboks",
                     "gls": "GLS",
                     "dao": "DAO",
                     "bring": "Bring",
+                    "burd": "Burd",
                     "dhl": "DHL",
                     "ups": "UPS",
                     "fedex": "FedEx",
@@ -1504,19 +2056,22 @@ class ScraperService:
 
                 import re
 
+                # Find ALL providers mentioned in the text
                 for keyword, name in known_providers.items():
-                    # Use word boundary matching to avoid false positives like "ups" in "groups"
                     pattern = r"\b" + re.escape(keyword) + r"\b"
                     if re.search(pattern, text_lower, re.IGNORECASE):
-                        provider_name = name
-                        logger.info(f"[SHIPPING] Detected provider: {provider_name}")
-                        break
+                        if name not in providers_list:
+                            providers_list.append(name)
+                            logger.info(f"[SHIPPING] Detected provider: {name}")
 
-                # Strategy 2: Extract from common patterns like "Levering med GLS" or "PostNord delivery"
+                # Use all found providers or combine them
+                if len(providers_list) > 1:
+                    provider_name = " / ".join(providers_list)
+                elif len(providers_list) == 1:
+                    provider_name = providers_list[0]
+
+                # Strategy 2: Extract from common patterns
                 if not provider_name:
-                    import re
-
-                    # Look for patterns like "levering med X", "delivery via X", "shipping by X"
                     patterns = [
                         r"(?:levering|forsendelse|fragt)\s+(?:med|via|by)\s+([A-Z][A-Za-z]+)",
                         r"([A-Z][A-Za-z]+)\s+(?:levering|forsendelse|delivery|shipping)",
@@ -1526,7 +2081,6 @@ class ScraperService:
                         match = re.search(pattern, text)
                         if match:
                             potential_name = match.group(1)
-                            # Verify it's not a common word
                             if potential_name.lower() not in [
                                 "levering",
                                 "delivery",
@@ -1540,92 +2094,66 @@ class ScraperService:
                                 logger.info(f"[SHIPPING] Extracted provider from pattern: {provider_name}")
                                 break
 
-                # Check for free shipping (gratis levering)
+                # Check for free shipping
                 is_free = any(word in text_lower for word in ["gratis", "free", "fri levering", "fri fragt"])
-
-                # Check for warehouse/direct delivery indicators (often means free or standard shipping)
-                has_standard_delivery = any(
-                    word in text_lower
-                    for word in ["levering", "forsendelse", "sendes", "delivered", "warehouse", "lager"]
-                )
 
                 # Extract delivery time
                 delivery_time = self.data_extractor.extract_delivery_time_with_regex(text)
                 if delivery_time:
                     logger.info(f"[SHIPPING] Detected delivery time: {delivery_time}")
 
-                # Extract cost
-                cost = None
-                currency = "DKK"
+                # Extract cost using improved method
+                cost, currency = self._extract_shipping_cost_from_text(text, text_lower)
 
-                # Check if this section is about delivery time, not price
-                delivery_time_patterns = [
-                    r"\d+-\d+\s*(hverdage|arbejdsdage|dage|days)",  # "1-2 hverdage"
-                    r"(levering|delivery|shipping)\s*\d+-\d+\s*(hverdage|arbejdsdage|dage|days)",  # "levering 1-2 dage"
-                ]
-                import re
-
-                is_delivery_time_only = any(re.search(pattern, text_lower) for pattern in delivery_time_patterns)
-
-                price_match = None
-                if is_delivery_time_only:
-                    logger.info(f"[SHIPPING] Skipping - this is delivery time info, not shipping cost")
-                elif is_free:
-                    cost = 0.0
-                    logger.info(f"[SHIPPING] Free shipping detected")
-                else:
-                    price_match = self.data_extractor.extract_price_with_regex(text)
-                    if price_match:
-                        extracted_price, extracted_currency = price_match
-                        # Only use price if it's reasonable for shipping (< 500 DKK)
-                        if extracted_price < 500:
-                            cost = extracted_price
-                            currency = extracted_currency
-                            logger.info(f"[SHIPPING] Detected cost: {cost} {currency}")
-                        else:
-                            logger.info(f"[SHIPPING] Ignoring unrealistic shipping price: {extracted_price}")
+                # Classify delivery type based on text content
+                delivery_type = self._classify_delivery_type(text_lower)
 
                 # Determine if we should add this provider
-                # RELIABLE criteria:
-                # 1. Specific provider name (DHL, PostNord, etc.)
-                # 2. Explicit price found (0 < price < 500)
-                # 3. Free shipping indicator
-                # 4. Standard delivery with delivery time (medium confidence)
                 has_confident_info = (
-                    provider_name
-                    or (price_match and 0 < cost < 500)
-                    or is_free
-                    or (has_standard_delivery and delivery_time)  # Medium confidence
+                    provider_name or  # Named provider
+                    cost is not None or  # Has cost (including 0 for free)
+                    (delivery_time and any(k in text_lower for k in ["levering", "delivery", "shipping", "forsendelse"]))  # Has delivery time and shipping mention
                 )
 
                 if has_confident_info:
-                    final_name = provider_name or ("Free Shipping" if is_free else "Standard Delivery")
+                    final_name = provider_name or ("Free Shipping" if cost == 0.0 else "Standard Delivery")
                     final_description = text[:200] if len(text) > 200 else text
 
-                    # Classify delivery type based on text content
-                    delivery_type = self._classify_delivery_type(text_lower)
+                    # Deduplicate based on name, cost, delivery time, and type
+                    provider_key = f"{final_name}_{cost}_{delivery_time}_{delivery_type}"
+                    if provider_key in seen_providers:
+                        logger.debug(f"[SHIPPING] Skipping duplicate: {provider_key}")
+                        continue
+                    seen_providers.add(provider_key)
 
                     providers.append(
                         ShippingProvider(
                             name=final_name,
-                            price=cost if (price_match or is_free) else None,  # None if we don't know the price
-                            currency=currency if (price_match or is_free) else None,
+                            price=cost,
+                            currency=currency if cost is not None else None,
                             delivery_time=delivery_time or "Unknown",
                             delivery_type=delivery_type,
                             description=final_description,
                         )
                     )
                     logger.info(
-                        f"[SHIPPING] Added: {final_name}, {cost if cost else 'Price TBD'} {currency if cost else ''}, {delivery_time or 'Unknown'}, Type: {delivery_type}"
+                        f"[SHIPPING] Added: {final_name}, {cost if cost is not None else 'Price TBD'} {currency if cost is not None else ''}, {delivery_time or 'Unknown'}, Type: {delivery_type}"
                     )
                 else:
-                    logger.info(f"[SHIPPING] Skipping section - no confident shipping info found")
+                    logger.debug(f"[SHIPPING] Skipping section - no confident shipping info found")
 
             if providers:
-                logger.info(f"Extracted {len(providers)} shipping provider(s)")
+                logger.info(f"[SHIPPING] Extracted {len(providers)} shipping provider(s) from product page")
+            else:
+                logger.warning("[SHIPPING] No shipping providers found on product page")
+                logger.info(f"[SHIPPING] Diagnostic info:")
+                logger.info(f"  - Total sections analyzed: {len(unique_sections)}")
+                logger.info(f"  - Shipping-related sections: {len([s for s in unique_sections if self._is_shipping_related(s.get_text(strip=True).lower())])}")
+                logger.info(f"  - Consider checking if shipping info requires cart/checkout navigation for this site")
 
         except Exception as e:
-            logger.warning(f"Error extracting shipping providers: {e}")
+            logger.warning(f"[SHIPPING] Error extracting shipping providers: {e}")
+            logger.debug(f"[SHIPPING] Traceback: {traceback.format_exc()}")
 
         return providers
 

@@ -71,7 +71,92 @@ jobs:
         run: |
           radon cc scrap-services/src -a -s > reports/radon-complexity.txt || true
           radon mi scrap-services/src -s > reports/radon-maintainability.txt || true
-          echo "RADON_MI=$(radon mi scrap-services/src -s | grep -oP 'Maintainability Index: \K[0-9.]+' | head -1 || echo '0')" >> $GITHUB_ENV
+          
+          # Calculate weighted average maintainability score
+          python3 << 'PYTHON_SCRIPT'
+          import re
+          from pathlib import Path
+          
+          # Read radon output
+          radon_output = Path("reports/radon-maintainability.txt").read_text()
+          
+          file_scores = []
+          total_lines = 0
+          
+          for line in radon_output.strip().split('\n'):
+              if not line.strip() or line.startswith('**') or line.startswith('Average'):
+                  continue
+              
+              # Match pattern: path - grade (score)
+              match = re.match(r'^(.+?)\s+-\s+([A-F])\s+\(([0-9.]+)\)', line.strip())
+              if match:
+                  filepath, grade, score_str = match.groups()
+                  score = float(score_str)
+                  
+                  # Get file size for weighting
+                  file_path = Path(filepath.strip())
+                  try:
+                      if file_path.exists():
+                          lines_of_code = len(file_path.read_text(encoding='utf-8').splitlines())
+                      else:
+                          lines_of_code = 100
+                  except Exception:
+                      lines_of_code = 100
+                  
+                  file_scores.append((filepath.strip(), score, lines_of_code, grade))
+                  total_lines += lines_of_code
+          
+          # Calculate weighted average
+          if file_scores and total_lines > 0:
+              weighted_sum = sum(score * loc for _, score, loc, _ in file_scores)
+              weighted_avg = weighted_sum / total_lines
+              simple_avg = sum(score for _, score, _, _ in file_scores) / len(file_scores)
+              
+              # Grade distribution
+              grade_dist = {'A': 0, 'B': 0, 'C': 0, 'F': 0}
+              for _, _, _, grade in file_scores:
+                  grade_dist[grade] = grade_dist.get(grade, 0) + 1
+              
+              # Determine overall grade
+              if weighted_avg >= 20:
+                  overall_grade = 'A'
+              elif weighted_avg >= 10:
+                  overall_grade = 'B'
+              elif weighted_avg >= 0:
+                  overall_grade = 'C'
+              else:
+                  overall_grade = 'F'
+              
+              print(f"\n{'='*60}")
+              print(f"Maintainability Analysis (Weighted Average)")
+              print(f"{'='*60}")
+              print(f"Weighted Average: {weighted_avg:.2f}/100 (Grade: {overall_grade})")
+              print(f"Simple Average:   {simple_avg:.2f}/100")
+              print(f"Files Analyzed:   {len(file_scores)}")
+              print(f"Total Lines:      {total_lines:,}")
+              print(f"\nGrade Distribution:")
+              print(f"  A (20-100): {grade_dist['A']} files")
+              print(f"  B (10-19):  {grade_dist['B']} files")
+              print(f"  C (0-9):    {grade_dist['C']} files")
+              print(f"  F (<0):     {grade_dist['F']} files")
+              
+              # Export to GitHub ENV
+              import os
+              with open(os.environ['GITHUB_ENV'], 'a') as f:
+                  f.write(f"RADON_MI={weighted_avg:.2f}\n")
+                  f.write(f"RADON_MI_SIMPLE={simple_avg:.2f}\n")
+                  f.write(f"RADON_MI_GRADE={overall_grade}\n")
+                  f.write(f"RADON_MI_FILES_TOTAL={len(file_scores)}\n")
+                  f.write(f"RADON_MI_FILES_A={grade_dist['A']}\n")
+                  f.write(f"RADON_MI_FILES_B={grade_dist['B']}\n")
+                  f.write(f"RADON_MI_FILES_C={grade_dist['C']}\n")
+                  f.write(f"RADON_MI_FILES_F={grade_dist['F']}\n")
+          else:
+              print("No maintainability data found")
+              import os
+              with open(os.environ['GITHUB_ENV'], 'a') as f:
+                  f.write("RADON_MI=0\n")
+          PYTHON_SCRIPT
 
       - name: Check Code Formatting (Black)
         continue-on-error: true
@@ -213,8 +298,8 @@ jobs:
               <div class="section">
                   <h2>📋 Quality Thresholds</h2>
                   <ul>
-                      <li>Pylint Score: Minimum 6.0/10.0</li>
-                      <li>Maintainability Index: Informational only (no threshold)</li>
+                      <li>Pylint Score: Minimum 6.0/10.0 (Required)</li>
+                      <li>Maintainability Index (Weighted Average): Informational only (No threshold)</li>
                   </ul>
               </div>
 
@@ -260,24 +345,30 @@ jobs:
         run: |
           PYLINT=${PYLINT_SCORE:-0}
           RADON=${RADON_MI:-0}
+          RADON_GRADE=${RADON_MI_GRADE:-F}
           
           echo "Pylint Score: $PYLINT"
-          echo "Maintainability Index: $RADON (informational only)"
+          echo "Maintainability Index (Weighted): $RADON (Grade: $RADON_GRADE) - Informational only"
           
-          # Set threshold
+          # Set threshold (only Pylint is enforced)
           PYLINT_THRESHOLD=6.0
           
           echo "pylint_score=$PYLINT" >> $GITHUB_OUTPUT
           echo "radon_mi=$RADON" >> $GITHUB_OUTPUT
+          echo "radon_grade=$RADON_GRADE" >> $GITHUB_OUTPUT
           echo "pylint_threshold=$PYLINT_THRESHOLD" >> $GITHUB_OUTPUT
           
-          # Check if Pylint score meets threshold (MI is informational only)
+          # Check if Pylint score meets threshold (Radon is informational only)
           if (( $(echo "$PYLINT >= $PYLINT_THRESHOLD" | bc -l) )); then
             echo "quality_check=passed" >> $GITHUB_OUTPUT
             echo "✅ Code quality check PASSED"
+            echo "  - Pylint: $PYLINT >= $PYLINT_THRESHOLD ✅"
+            echo "  - Maintainability: $RADON (Grade: $RADON_GRADE) ℹ️ Info"
           else
             echo "quality_check=failed" >> $GITHUB_OUTPUT
             echo "❌ Code quality check FAILED"
+            echo "  - Pylint: $PYLINT < $PYLINT_THRESHOLD ❌"
+            echo "  - Maintainability: $RADON (Grade: $RADON_GRADE) ℹ️ Info"
           fi
 
       - name: Comment PR with Results
@@ -288,6 +379,7 @@ jobs:
           script: |
             const pylintScore = '${{ steps.calculate-score.outputs.pylint_score }}';
             const radonMi = '${{ steps.calculate-score.outputs.radon_mi }}';
+            const radonGrade = '${{ steps.calculate-score.outputs.radon_grade }}';
             const pylintThreshold = '${{ steps.calculate-score.outputs.pylint_threshold }}';
             const qualityCheck = '${{ steps.calculate-score.outputs.quality_check }}';
             
@@ -303,7 +395,7 @@ jobs:
             | Metric | Score | Threshold | Status |
             |--------|-------|-----------|--------|
             | Pylint | ${pylintScore}/10 | ${pylintThreshold}/10 | ${pylintPassed ? '✅ Pass' : '❌ Fail'} |
-            | Maintainability Index | ${radonMi}/100 | Informational | ℹ️ Info |
+            | Maintainability Index (Weighted) | ${radonMi}/100 (${radonGrade}) | Informational | ℹ️ Info |
             
             ### 📊 Detailed Reports
             
@@ -332,4 +424,5 @@ jobs:
         run: |
           echo "::error::Code quality check failed. Pylint score: ${{ steps.calculate-score.outputs.pylint_score }}"
           echo "::error::Required: Pylint >= ${{ steps.calculate-score.outputs.pylint_threshold }}"
+          echo "::notice::Maintainability Index (weighted): ${{ steps.calculate-score.outputs.radon_mi }} (Grade: ${{ steps.calculate-score.outputs.radon_grade }}) - Informational only"
           exit 1
