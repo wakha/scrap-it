@@ -13,7 +13,7 @@ async def save_blocked_log(
     error_msg: str
 ) -> None:
     """Save log entry for blocked scraping attempts.
-    
+
     Args:
         source_name: Website source name
         started_at: When scraping started
@@ -46,7 +46,7 @@ async def save_failure_log(
     bot_protection_detected: bool = False
 ) -> None:
     """Save log entry for failed scraping attempts.
-    
+
     Args:
         source_name: Website source name
         started_at: When scraping started
@@ -75,7 +75,7 @@ async def save_success_log(
     products_scraped: int = 1
 ) -> None:
     """Save log entry for successful scraping.
-    
+
     Args:
         source_name: Website source name
         started_at: When scraping started
@@ -95,8 +95,8 @@ async def save_success_log(
             robots_txt_message=analysis_result.robots_txt_message,
             bot_protection_detected=analysis_result.bot_protection_detected,
             protection_types=(
-                ", ".join(analysis_result.protection_types) 
-                if analysis_result.protection_types 
+                ", ".join(analysis_result.protection_types)
+                if analysis_result.protection_types
                 else None
             ),
             protection_confidence=analysis_result.protection_confidence,
@@ -106,10 +106,10 @@ async def save_success_log(
 
 def determine_blocking_status(analysis_result) -> tuple[str, str]:
     """Determine status and error message when scraping is blocked.
-    
+
     Args:
         analysis_result: The analysis result object
-        
+
     Returns:
         Tuple of (status, error_message)
     """
@@ -125,5 +125,5 @@ def determine_blocking_status(analysis_result) -> tuple[str, str]:
     else:
         status = STATUS_FAILURE
         error_msg = "Website analysis failed"
-    
+
     return status, error_msg

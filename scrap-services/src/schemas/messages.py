@@ -2,7 +2,7 @@
 
 These schemas serve as:
 1. Type-safe contracts between services
-2. JSON serialization for future Kafka messages  
+2. JSON serialization for future Kafka messages
 3. Validation layer for the pipeline
 
 Future Kafka Topics:

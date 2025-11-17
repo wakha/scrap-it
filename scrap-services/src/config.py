@@ -456,6 +456,7 @@ class Settings(BaseSettings):
     default_availability: str = "in stock"
 
     class Config:
+        """Pydantic configuration."""
         env_file = ".env"
         case_sensitive = False
         extra = "ignore"  # Ignore extra fields from .env

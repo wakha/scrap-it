@@ -15,7 +15,7 @@ from src.database.config import get_async_db
 from src.config import settings
 from src.utils.logger import logger
 from src.schemas.messages import AnalysisResult, ScrapedProduct, ProcessedProduct
-from src.constants import LOG_SEPARATOR, STATUS_SUCCESS
+from src.constants import LOG_SEPARATOR
 from src.helpers.scraper_log_helpers import (
     save_blocked_log,
     save_failure_log,
@@ -97,14 +97,17 @@ async def scrape_url_async(
         logger.info(f"  Shipping Providers: {len(scraped_product.shipping_providers)}")
 
         # STEP 3: ETL Processing (ETL Service)
-        # Future: Consumes from 'scraped-products', publishes ProcessedProduct to 'processed-products'
+        # Future: Consumes from 'scraped-products', publishes ProcessedProduct
+        # to 'processed-products'
         logger.info(f"\n{LOG_SEPARATOR}")
         logger.info("STEP 3: ETL Processing & Storage")
         logger.info(LOG_SEPARATOR)
 
-        async with get_async_db() as db:
+        async with get_async_db() as _:
             etl = ETLService()
-            processed_product: ProcessedProduct = await etl.save_and_emit(scraped_product)
+            processed_product: ProcessedProduct = await etl.save_and_emit(
+                scraped_product
+            )
 
             if processed_product:
                 _log_processed_product(processed_product)
@@ -130,7 +133,7 @@ async def scrape_url_async(
 
 def _log_analysis_results(analysis: AnalysisResult) -> None:
     """Log analysis results in a formatted way.
-    
+
     Args:
         analysis: The analysis result to log
     """
@@ -154,14 +157,14 @@ async def _handle_blocked_scraping(
     analysis: AnalysisResult
 ) -> None:
     """Handle blocked scraping scenario.
-    
+
     Args:
         source_name: Website source name
         started_at: When scraping started
         analysis: The analysis result
     """
     logger.warning("[STOP] Website cannot be scraped")
-    status, error_msg = determine_blocking_status(analysis)
+    _, error_msg = determine_blocking_status(analysis)
     await save_blocked_log(source_name, started_at, analysis, error_msg)
 
 
@@ -171,7 +174,7 @@ async def _handle_scraping_failure(
     analysis: AnalysisResult
 ) -> None:
     """Handle scraping failure scenario.
-    
+
     Args:
         source_name: Website source name
         started_at: When scraping started
@@ -189,7 +192,7 @@ async def _handle_scraping_failure(
 
 def _log_processed_product(processed_product: ProcessedProduct) -> None:
     """Log processed product information.
-    
+
     Args:
         processed_product: The processed product to log
     """
@@ -204,7 +207,7 @@ async def _handle_pipeline_error(
     error: Exception
 ) -> None:
     """Handle pipeline error by logging it.
-    
+
     Args:
         source_name: Website source name
         started_at: When scraping started

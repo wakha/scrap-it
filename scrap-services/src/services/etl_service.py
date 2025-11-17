@@ -71,10 +71,10 @@ class ETLService:
         scraped_product: ScrapedProduct
     ) -> ProcessedProduct:
         """Save product to database.
-        
+
         Args:
             scraped_product: Product to save
-            
+
         Returns:
             ProcessedProduct with database ID
         """
@@ -117,7 +117,7 @@ class ETLService:
         providers: List
     ) -> None:
         """Add shipping providers to database, deduplicating by name.
-        
+
         Args:
             db: Database session
             product_id: Product ID to associate providers with
@@ -147,11 +147,11 @@ class ETLService:
         scraped_product: ScrapedProduct
     ) -> ProcessedProduct:
         """Create ProcessedProduct from saved Product.
-        
+
         Args:
             product: Saved Product model
             scraped_product: Original scraped product data
-            
+
         Returns:
             ProcessedProduct schema
         """
@@ -171,11 +171,11 @@ class ETLService:
 
     async def _handle_retry(self, error: OperationalError, attempt: int) -> bool:
         """Handle retry logic for operational errors.
-        
+
         Args:
             error: The operational error
             attempt: Current attempt number
-            
+
         Returns:
             True if should retry, False otherwise
         """
@@ -246,7 +246,7 @@ class ETLService:
         **kwargs
     ) -> None:
         """Save log entry to database.
-        
+
         Args:
             name: Website name
             status: Scrape status
@@ -277,11 +277,11 @@ class ETLService:
 
     async def _handle_log_retry(self, error: OperationalError, attempt: int) -> bool:
         """Handle retry logic for log save errors.
-        
+
         Args:
             error: The operational error
             attempt: Current attempt number
-            
+
         Returns:
             True if should retry, False otherwise
         """

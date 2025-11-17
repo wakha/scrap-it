@@ -24,11 +24,11 @@ class ProductPageValidator:
         url: str
     ) -> tuple[bool, Dict[str, bool]]:
         """Validate if page is a product page.
-        
+
         Args:
             page: Playwright page object
             url: Page URL
-            
+
         Returns:
             Tuple of (is_valid, indicators_dict)
         """
@@ -56,10 +56,10 @@ class ProductPageValidator:
 
     def _has_product_url_pattern(self, url: str) -> bool:
         """Check if URL has product-specific patterns.
-        
+
         Args:
             url: URL to check
-            
+
         Returns:
             True if has product pattern, False otherwise
         """
@@ -69,10 +69,10 @@ class ProductPageValidator:
 
     async def _has_valid_title(self, page: Page) -> bool:
         """Check for valid product title.
-        
+
         Args:
             page: Playwright page
-            
+
         Returns:
             True if valid title found
         """
@@ -100,10 +100,10 @@ class ProductPageValidator:
 
     async def _has_valid_description(self, page: Page) -> bool:
         """Check for valid product description.
-        
+
         Args:
             page: Playwright page
-            
+
         Returns:
             True if valid description found
         """
@@ -126,7 +126,7 @@ class ProductPageValidator:
                         text = await elem.get_attribute('content')
                     else:
                         text = await elem.inner_text()
-                    
+
                     if text and len(text.strip()) > MIN_DESCRIPTION_LENGTH:
                         return True
             except:
@@ -136,10 +136,10 @@ class ProductPageValidator:
 
     async def _has_valid_price(self, page: Page) -> bool:
         """Check for valid product price.
-        
+
         Args:
             page: Playwright page
-            
+
         Returns:
             True if valid price found
         """
@@ -181,10 +181,10 @@ class ProductPageValidator:
 
     def _contains_price(self, text: str) -> bool:
         """Check if text contains price information.
-        
+
         Args:
             text: Text to check
-            
+
         Returns:
             True if contains price
         """
@@ -194,10 +194,10 @@ class ProductPageValidator:
 
     async def _has_add_to_cart_button(self, page: Page) -> bool:
         """Check for add to cart button.
-        
+
         Args:
             page: Playwright page
-            
+
         Returns:
             True if button found and visible
         """

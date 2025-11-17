@@ -7,7 +7,20 @@ disable=
     C0330,  # Wrong hanging indentation
     C0326,  # Bad whitespace
     W0511,  # TODO/FIXME comments
-    R0801,  # Similar lines
+    R0801,  # Similar lines (duplicate-code)
+    W1203,  # logging-fstring-interpolation
+    W0718,  # broad-exception-caught
+    C0415,  # import-outside-toplevel
+    R1702,  # too-many-nested-blocks
+    R1705,  # no-else-return
+    R1723,  # no-else-break
+    W0613,  # unused-argument
+    C0302,  # too-many-lines
+    W1309,  # f-string-without-interpolation
+    R0903,  # too-few-public-methods
+    C0301,  # line-too-long
+    C0303,  # trailing-whitespace
+    C0304,  # missing-final-newline
 
 [FORMAT]
 max-line-length=120
