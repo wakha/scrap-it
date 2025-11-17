@@ -6,6 +6,7 @@ import asyncio
 import sys
 from datetime import datetime
 from urllib.parse import urlparse
+from typing import Optional
 
 from src.services.analyzer_service import AnalyzerService
 from src.services.scraper_service import ScraperService
@@ -14,9 +15,20 @@ from src.database.config import get_async_db
 from src.config import settings
 from src.utils.logger import logger
 from src.schemas.messages import AnalysisResult, ScrapedProduct, ProcessedProduct
+from src.constants import LOG_SEPARATOR
+from src.helpers.scraper_log_helpers import (
+    save_blocked_log,
+    save_failure_log,
+    save_success_log,
+    determine_blocking_status,
+)
 
 
-async def scrape_url_async(url: str, product_path: str = None, checkout_path: str = None):
+async def scrape_url_async(
+    url: str,
+    product_path: Optional[str] = None,
+    checkout_path: Optional[str] = None
+) -> None:
     """
     Scrape pipeline for scraping a url.
 
@@ -46,9 +58,9 @@ async def scrape_url_async(url: str, product_path: str = None, checkout_path: st
 
     try:
         # STEP 1: Website Analysis (Analyzer Service)
-        logger.info("=" * 70)
+        logger.info(LOG_SEPARATOR)
         logger.info("STEP 1: Website Analysis & Product Discovery")
-        logger.info("=" * 70)
+        logger.info(LOG_SEPARATOR)
 
         async with AnalyzerService(headless=settings.headless_mode) as analyzer:
             analysis: AnalysisResult = await analyzer.analyze_website(
@@ -56,81 +68,27 @@ async def scrape_url_async(url: str, product_path: str = None, checkout_path: st
             )
 
         # Log analysis results
-        logger.info(f"\nAnalysis Results for {analysis.domain}:")
-        logger.info(f"  Can Scrape: {analysis.can_scrape}")
-        logger.info(f"  Product URL: {analysis.product_url or 'N/A'}")
-        logger.info(f"  robots.txt: {analysis.robots_txt_message}")
-        logger.info(f"  Bot Protection: {analysis.bot_protection_detected}")
-
-        if analysis.bot_protection_detected:
-            logger.info(f"    Types: {', '.join(analysis.protection_types)}")
-            logger.info(f"    Confidence: {analysis.protection_confidence}")
-
-        detected_selectors = sum(1 for v in analysis.selectors.values() if v)
-        logger.info(f"  Selectors Detected: {detected_selectors}/6")
+        _log_analysis_results(analysis)
 
         # Check if we should proceed
         if not analysis.can_scrape:
-            logger.warning(f"[STOP] Website cannot be scraped")
-
-            # Determine status
-            if analysis.bot_protection_detected:
-                status = "blocked"
-                error_msg = f"Bot protection detected: {', '.join(analysis.protection_types)}"
-            elif not analysis.robots_txt_allowed:
-                status = "skipped"
-                error_msg = f"robots.txt disallows scraping"
-            elif not analysis.product_url:
-                status = "failure"
-                error_msg = "Could not discover any products"
-            else:
-                status = "failure"
-                error_msg = "Website analysis failed"
-
-            # Save log
-            async with get_async_db() as db:
-                etl = ETLService()
-                await etl.save_scraper_log(
-                    website=source_name,
-                    status=status,
-                    started_at=started_at,
-                    completed_at=datetime.now(),
-                    error_message=error_msg,
-                    products_scraped=0,
-                    robots_txt_allowed=analysis.robots_txt_allowed,
-                    robots_txt_message=analysis.robots_txt_message,
-                    bot_protection_detected=analysis.bot_protection_detected,
-                    protection_types=", ".join(analysis.protection_types),
-                    protection_confidence=analysis.protection_confidence,
-                    crawl_delay=analysis.crawl_delay,
-                )
-
+            await _handle_blocked_scraping(source_name, started_at, analysis)
             return
 
         # STEP 2: Scraping (Scraper Service)
         # Future: Consumes from 'analysis-results', publishes ScrapedProduct to 'scraped-products'
-        logger.info("\n" + "=" * 70)
+        logger.info(f"\n{LOG_SEPARATOR}")
         logger.info("STEP 2: Product Scraping")
-        logger.info("=" * 70)
+        logger.info(LOG_SEPARATOR)
 
-        async with ScraperService(headless=settings.headless_mode, screenshot=settings.screenshot_enabled) as scraper:
+        async with ScraperService(
+            headless=settings.headless_mode,
+            screenshot=settings.screenshot_enabled
+        ) as scraper:
             scraped_product: ScrapedProduct = await scraper.scrape(analysis)
 
         if not scraped_product:
-            logger.error("[ERROR] Scraping failed")
-
-            async with get_async_db() as db:
-                etl = ETLService()
-                await etl.save_scraper_log(
-                    website=source_name,
-                    status="failure",
-                    started_at=started_at,
-                    completed_at=datetime.now(),
-                    error_message="Failed to extract product data",
-                    products_scraped=0,
-                    robots_txt_allowed=analysis.robots_txt_allowed,
-                    bot_protection_detected=analysis.bot_protection_detected,
-                )
+            await _handle_scraping_failure(source_name, started_at, analysis)
             return
 
         logger.info(f"\n[SUCCESS] Scraped Product:")
@@ -139,64 +97,126 @@ async def scrape_url_async(url: str, product_path: str = None, checkout_path: st
         logger.info(f"  Shipping Providers: {len(scraped_product.shipping_providers)}")
 
         # STEP 3: ETL Processing (ETL Service)
-        # Future: Consumes from 'scraped-products', publishes ProcessedProduct to 'processed-products'
-        logger.info("\n" + "=" * 70)
+        # Future: Consumes from 'scraped-products', publishes ProcessedProduct
+        # to 'processed-products'
+        logger.info(f"\n{LOG_SEPARATOR}")
         logger.info("STEP 3: ETL Processing & Storage")
-        logger.info("=" * 70)
+        logger.info(LOG_SEPARATOR)
 
-        async with get_async_db() as db:
+        async with get_async_db() as _:
             etl = ETLService()
-
-            # Save and emit processed product
-            processed_product: ProcessedProduct = await etl.save_and_emit(scraped_product)
+            processed_product: ProcessedProduct = await etl.save_and_emit(
+                scraped_product
+            )
 
             if processed_product:
-                logger.info(f"[SUCCESS] Product saved to database (ID: {processed_product.product_id})")
-                logger.info(f"  Is New: {processed_product.is_new}")
-                logger.info(f"  Processed At: {processed_product.processed_at}")
-
+                _log_processed_product(processed_product)
                 # Future: Publish to Kafka topic 'processed-products'
                 # await kafka_producer.send('processed-products', processed_product.model_dump_json())
 
-            # Save scraper log
-            completed_at = datetime.now()
-            duration = (completed_at - started_at).total_seconds()
-
-            await etl.save_scraper_log(
-                website=source_name,
-                status="success",
-                started_at=started_at,
-                completed_at=completed_at,
-                products_scraped=1 if processed_product else 0,
-                robots_txt_allowed=analysis.robots_txt_allowed,
-                robots_txt_message=analysis.robots_txt_message,
-                bot_protection_detected=analysis.bot_protection_detected,
-                protection_types=", ".join(analysis.protection_types) if analysis.protection_types else None,
-                protection_confidence=analysis.protection_confidence,
-                crawl_delay=analysis.crawl_delay,
+            await save_success_log(
+                source_name,
+                started_at,
+                analysis,
+                products_scraped=1 if processed_product else 0
             )
 
-        logger.info("\n" + "=" * 70)
+        duration = (datetime.now() - started_at).total_seconds()
+        logger.info(f"\n{LOG_SEPARATOR}")
         logger.info(f"[COMPLETE] Pipeline Complete! Duration: {duration:.2f}s")
-        logger.info("=" * 70)
+        logger.info(LOG_SEPARATOR)
 
     except Exception as e:
         logger.error(f"[ERROR] Error in pipeline: {e}")
+        await _handle_pipeline_error(source_name, started_at, e)
 
-        # Save error log
-        try:
-            async with get_async_db() as db:
-                etl = ETLService()
-                await etl.save_scraper_log(
-                    website=source_name,
-                    status="failure",
-                    started_at=started_at,
-                    completed_at=datetime.now(),
-                    error_message=str(e),
-                    products_scraped=0,
-                )
-        except Exception as log_error:
-            logger.error(f"Could not save error log: {log_error}")
+
+def _log_analysis_results(analysis: AnalysisResult) -> None:
+    """Log analysis results in a formatted way.
+
+    Args:
+        analysis: The analysis result to log
+    """
+    logger.info(f"\nAnalysis Results for {analysis.domain}:")
+    logger.info(f"  Can Scrape: {analysis.can_scrape}")
+    logger.info(f"  Product URL: {analysis.product_url or 'N/A'}")
+    logger.info(f"  robots.txt: {analysis.robots_txt_message}")
+    logger.info(f"  Bot Protection: {analysis.bot_protection_detected}")
+
+    if analysis.bot_protection_detected:
+        logger.info(f"    Types: {', '.join(analysis.protection_types)}")
+        logger.info(f"    Confidence: {analysis.protection_confidence}")
+
+    detected_selectors = sum(1 for v in analysis.selectors.values() if v)
+    logger.info(f"  Selectors Detected: {detected_selectors}/6")
+
+
+async def _handle_blocked_scraping(
+    source_name: str,
+    started_at: datetime,
+    analysis: AnalysisResult
+) -> None:
+    """Handle blocked scraping scenario.
+
+    Args:
+        source_name: Website source name
+        started_at: When scraping started
+        analysis: The analysis result
+    """
+    logger.warning("[STOP] Website cannot be scraped")
+    _, error_msg = determine_blocking_status(analysis)
+    await save_blocked_log(source_name, started_at, analysis, error_msg)
+
+
+async def _handle_scraping_failure(
+    source_name: str,
+    started_at: datetime,
+    analysis: AnalysisResult
+) -> None:
+    """Handle scraping failure scenario.
+
+    Args:
+        source_name: Website source name
+        started_at: When scraping started
+        analysis: The analysis result
+    """
+    logger.error("[ERROR] Scraping failed")
+    await save_failure_log(
+        source_name,
+        started_at,
+        "Failed to extract product data",
+        robots_txt_allowed=analysis.robots_txt_allowed,
+        bot_protection_detected=analysis.bot_protection_detected
+    )
+
+
+def _log_processed_product(processed_product: ProcessedProduct) -> None:
+    """Log processed product information.
+
+    Args:
+        processed_product: The processed product to log
+    """
+    logger.info(f"[SUCCESS] Product saved to database (ID: {processed_product.product_id})")
+    logger.info(f"  Is New: {processed_product.is_new}")
+    logger.info(f"  Processed At: {processed_product.processed_at}")
+
+
+async def _handle_pipeline_error(
+    source_name: str,
+    started_at: datetime,
+    error: Exception
+) -> None:
+    """Handle pipeline error by logging it.
+
+    Args:
+        source_name: Website source name
+        started_at: When scraping started
+        error: The exception that occurred
+    """
+    try:
+        await save_failure_log(source_name, started_at, str(error))
+    except Exception as log_error:
+        logger.error(f"Could not save error log: {log_error}")
 
 
 async def scrape_multiple_urls_async(urls: list[str]):
@@ -220,7 +240,7 @@ async def scrape_multiple_urls_async(urls: list[str]):
     logger.info(f"[COMPLETE] All {len(urls)} websites processed concurrently")
 
 
-def main():
+def main() -> None:
     """
     Entry point for scraper.
 

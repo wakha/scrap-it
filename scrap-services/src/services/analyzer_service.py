@@ -1,13 +1,25 @@
 """
-Website Analyzer Service
-Analyzes websites for scraping readiness using Playwright async API
-Returns AnalysisResult Pydantic schema
+Website Analyzer Service - Recreated from Scratch
+Intelligently analyzes websites and discovers product pages for scraping.
+Returns AnalysisResult Pydantic schema.
+
+Key Features:
+- Detects if provided URL is already a product page
+- Intelligently discovers random product pages if not
+- Works universally across all website structures
+- Maintains robots.txt and bot protection checks
+- Ensures variety by selecting different products each time
 """
 import logging
 import random
 import traceback
-from typing import Optional, Dict
+import re
+import urllib.robotparser
+import aiohttp
+from typing import Optional, Dict, List, Tuple, Set
 from urllib.parse import urlparse, urljoin
+from pathlib import Path
+from datetime import datetime
 from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
 from src.schemas.messages import AnalysisResult
@@ -17,38 +29,46 @@ logger = logging.getLogger(__name__)
 
 
 class AnalyzerService:
-    """Service for website analysis using Playwright with error handling"""
+    """
+    Service for intelligent website analysis and product discovery.
 
-    # Class-level cache for tracking selected URLs per website domain
-    _selected_urls_cache: Dict[str, set] = {}
-    _max_cache_size_per_domain: int = 50  # Keep last 50 URLs per domain
+    This service determines whether a URL is a product page, and if not,
+    intelligently discovers random product pages across any website structure.
+    """
+
+    # Class-level cache to track selected URLs per domain for variety
+    _selected_products_cache: Dict[str, Set[str]] = {}
+    _max_cache_size_per_domain: int = 100
 
     def __init__(self, timeout: int = None, headless: bool = True):
+        """Initialize the analyzer service."""
         self.playwright = None
         self.browser = None
         self.timeout = timeout or settings.page_timeout
         self.headless = settings.headless_mode if headless is None else headless
 
     async def __aenter__(self):
+        """Async context manager entry."""
         await self.start()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
         await self.close()
 
     async def start(self):
-        """Start Playwright and browser with error handling."""
+        """Start Playwright and browser."""
         try:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(headless=self.headless)
-            logger.info(" Analyzer started")
+            logger.info("[OK] Analyzer started")
         except Exception as e:
             logger.error(f"Failed to start analyzer: {e}")
             logger.debug(f"Stack trace: {traceback.format_exc()}")
             raise
 
     async def close(self):
-        """Close browser and Playwright with proper cleanup."""
+        """Close browser and Playwright."""
         try:
             if self.browser:
                 await self.browser.close()
@@ -56,10 +76,9 @@ class AnalyzerService:
             if self.playwright:
                 await self.playwright.stop()
                 self.playwright = None
-            logger.info(" Analyzer closed")
+            logger.info("[OK] Analyzer closed")
         except Exception as e:
             logger.error(f"Error closing analyzer: {e}")
-            # Don't raise here - best effort cleanup
 
     async def analyze_website(
         self,
@@ -69,39 +88,36 @@ class AnalyzerService:
         auto_discover: bool = True,
     ) -> AnalysisResult:
         """
-        Analyze website for scraping readiness.
+        Analyze website and find/validate product pages.
 
         Args:
             url: Website URL to analyze
-            product_path: Optional product page path
-            checkout_path: Optional checkout page path
-            auto_discover: Auto-discover product URLs
+            product_path: Optional explicit product page path
+            checkout_path: Optional checkout page path (unused, kept for compatibility)
+            auto_discover: Enable automatic product discovery
 
         Returns:
-            AnalysisResult Pydantic schema
+            AnalysisResult with product URL and scraping readiness info
         """
         parsed_url = urlparse(url)
         domain = parsed_url.netloc or parsed_url.path
         base_url = f"{parsed_url.scheme}://{domain}" if parsed_url.scheme else f"https://{domain}"
 
-        logger.info(f" Analyzing {domain}...")
+        logger.info(f"[ANALYZE] Analyzing {domain}...")
 
         # Ensure browser is started
         if not self.browser:
             await self.start()
 
-        # Check robots.txt
+        # STEP 1: Check robots.txt
         robots_result = await self._check_robots_txt(base_url, url)
 
-        # If robots.txt blocks critical paths, stop here with clear message
+        # If robots.txt blocks critical paths, stop immediately
         if not robots_result["base_allowed"]:
             logger.error(f"*** ANALYSIS STOPPED: {robots_result['message']} ***")
-            logger.error(f"The website's robots.txt explicitly blocks scraping of critical paths.")
+            logger.error("The website's robots.txt explicitly blocks scraping of critical paths.")
             logger.error(f"Blocked paths: {', '.join(robots_result['blocked_paths'])}")
-            logger.error(f"You cannot scrape this site without violating robots.txt rules.")
-            logger.error(f"Recommendation: Contact the site owner for API access or permission.")
 
-            # Return analysis with can_scrape=False
             return AnalysisResult(
                 domain=domain,
                 product_url=None,
@@ -113,45 +129,46 @@ class AnalyzerService:
                 robots_txt_allowed=False,
                 robots_txt_message=robots_result["message"],
                 bot_protection_detected=False,
-                bot_protection_type=[],
-                discovery_method="robots_txt_blocked",
-                confidence_score=0.0,
-                notes=f"SCRAPING BLOCKED: {robots_result['message']}. Blocked paths: {', '.join(robots_result['blocked_paths'])}",
+                protection_types=[],
+                protection_confidence="low",
+                notes=f"SCRAPING BLOCKED: {robots_result['message']}",
             )
 
-        # Check bot protection (combine robots.txt detection with other checks)
+        # STEP 2: Check bot protection
         bot_protection = await self._check_bot_protection(url)
-
-        # If robots.txt returned 403, it indicates bot protection
         if robots_result.get("bot_protection_detected"):
             bot_protection["detected"] = True
-            if "robots.txt 403" not in bot_protection.get("types", []):
-                bot_protection.setdefault("types", []).append("robots.txt 403")
+            bot_protection.setdefault("types", []).append("robots.txt 403")
 
-        # Discover product URL if needed
+        # STEP 3: Determine product URL
         product_url = None
-        if product_path:
-            # Use explicit product path
-            product_url = urljoin(base_url, product_path)
-        elif url and ("/product/" in url or "/catalogue/" in url or "/item/" in url or "/p/" in url):
-            # URL looks like a product page, use it directly
-            product_url = url
-        elif auto_discover:
-            # Try to discover product URL from the page
-            product_url = await self.discover_product_url(url)
-        else:
-            # Just use the URL as-is
-            product_url = url
 
-        # Detect selectors if product URL found
+        if product_path:
+            # Explicit product path provided
+            product_url = urljoin(base_url, product_path)
+            logger.info(f"[PRODUCT] Using explicit product path: {product_url}")
+
+        elif auto_discover:
+            # Intelligently determine if URL is already a product page or discover one
+            product_url = await self._find_product_page(url, domain, base_url)
+        else:
+            # Use URL as-is
+            product_url = url
+            logger.info(f"[PRODUCT] Using provided URL as-is: {product_url}")
+
+        # STEP 4: Detect selectors if product URL found
         selectors = {}
         if product_url:
-            selectors = await self.detect_universal_selectors(product_url)
+            selectors = await self._detect_selectors(product_url)
 
-        # Determine if we can scrape
-        can_scrape = robots_result["base_allowed"] and not bot_protection["detected"] and product_url is not None
+        # STEP 5: Determine if we can scrape
+        can_scrape = (
+            robots_result["base_allowed"]
+            and not bot_protection["detected"]
+            and product_url is not None
+        )
 
-        # Create AnalysisResult schema
+        # Create analysis result
         analysis = AnalysisResult(
             domain=domain,
             product_url=product_url,
@@ -168,516 +185,916 @@ class AnalyzerService:
             protection_confidence=bot_protection.get("confidence", "low"),
         )
 
-        logger.info(f" Analysis complete - Can scrape: {can_scrape}")
-
-        # Future: Publish to Kafka topic 'analysis-results'
-        # await kafka_producer.send('analysis-results', analysis.model_dump_json())
-
+        logger.info(f"[OK] Analysis complete - Can scrape: {can_scrape}")
         return analysis
 
-    def _score_product_url(self, url: str, add_randomness: bool = True) -> float:
-        """Score a URL based on likelihood it's a product page. Higher = more likely.
-        
-        Args:
-            url: The URL to score
-            add_randomness: If True, adds random variation to break deterministic ties
-            
-        Returns:
-            Float score (higher = more likely to be a product page)
+    async def _find_product_page(self, url: str, domain: str, base_url: str) -> Optional[str]:
         """
-        score = 0.0
-        url_lower = url.lower()
+        Intelligently find a product page URL.
 
-        # High confidence patterns (10-20 points)
-        high_confidence = [
-            "/product/",
-            "/products/",
-            "/p/",
-            "/item/",
-            "/vare/",
-            "/catalogue/",
-            "/catalog/",
-            "/pd/",
-            "/dp/",
-        ]
-        for pattern in high_confidence:
-            if pattern in url_lower:
-                score += 20
-                break
+        Strategy:
+        1. Check if the provided URL is already a product page
+        2. If not, discover and randomly select a product page from the site
+        3. Ensure variety by avoiding previously selected products
 
-        # Product ID patterns (15 points)
-        import re
-
-        if re.search(r"/\d{5,}", url) or re.search(r"[-_]\d{5,}", url):
-            score += 15
-
-        # Negative patterns - these are NOT products
-        negative_patterns = settings.non_product_patterns + [
-            "/cart/",
-            "/checkout/",
-            "/account/",
-            "/login/",
-            "/register/",
-        ]
-        for pattern in negative_patterns:
-            if pattern in url_lower:
-                score -= 50
-                break
-
-        # Medium confidence - looks like product path (5 points)
-        if url.count("/") >= 3 and not url.endswith("/"):
-            score += 5
-
-        # Add random variation (0-5 points) to break deterministic ties
-        if add_randomness and score > -10:
-            score += random.uniform(0, 5)
-
-        return score
-
-    def _filter_previously_selected(self, domain: str, candidates: list) -> list:
-        """Filter out URLs that were previously selected for this domain.
-        
         Args:
+            url: The URL to analyze
             domain: The website domain
-            candidates: List of (url, score) tuples
-            
-        Returns:
-            List of (url, score) tuples that haven't been selected before
-        """
-        if domain not in self._selected_urls_cache:
-            return candidates
-        
-        previously_selected = self._selected_urls_cache[domain]
-        new_candidates = [(url, score) for url, score in candidates if url not in previously_selected]
-        
-        if new_candidates and len(new_candidates) < len(candidates):
-            logger.info(f"[SELECTION] Filtered out {len(candidates) - len(new_candidates)} previously selected URLs")
-        
-        return new_candidates
+            base_url: The base URL of the site
 
-    def _mark_url_as_selected(self, domain: str, url: str):
-        """Mark a URL as selected for this domain to avoid repeating it.
-        
-        Args:
-            domain: The website domain
-            url: The selected URL
-        """
-        if domain not in self._selected_urls_cache:
-            self._selected_urls_cache[domain] = set()
-        
-        self._selected_urls_cache[domain].add(url)
-        
-        # Keep cache size bounded (FIFO-like behavior)
-        if len(self._selected_urls_cache[domain]) > self._max_cache_size_per_domain:
-            # Convert to list, remove oldest (first) item, convert back to set
-            cache_list = list(self._selected_urls_cache[domain])
-            self._selected_urls_cache[domain] = set(cache_list[1:])
-        
-        logger.debug(f"[SELECTION] Marked {url} as selected for {domain} (cache size: {len(self._selected_urls_cache[domain])})")
-
-    def _weighted_random_selection(self, scored_candidates: list, n: int) -> list:
-        """Select n URLs using weighted random selection based on scores.
-        
-        Higher-scored URLs have higher probability of selection, but lower-scored
-        ones still have a chance. This provides variety while maintaining quality.
-        
-        Args:
-            scored_candidates: List of (url, score) tuples sorted by score descending
-            n: Number of URLs to select
-            
         Returns:
-            List of selected URLs
+            Product page URL or None if not found
         """
-        if not scored_candidates:
-            return []
-        
-        if len(scored_candidates) <= n:
-            return [url for url, _ in scored_candidates]
-        
-        # Extract URLs and scores
-        urls = [url for url, _ in scored_candidates]
-        scores = [score for _, score in scored_candidates]
-        
-        # Convert scores to weights (add constant to handle negative scores)
-        min_score = min(scores)
-        offset = abs(min_score) + 10 if min_score < 0 else 0
-        weights = [score + offset for score in scores]
-        
-        # Ensure all weights are positive
-        if any(w <= 0 for w in weights):
-            # Fallback to equal weights if something went wrong
-            weights = [1.0] * len(weights)
-        
-        # Use weighted random sampling without replacement
+        # Check if URL is already a product page
+        logger.info("[PRODUCT] Checking if URL is already a product page...")
+        is_product = await self._is_product_page(url)
+
+        if is_product:
+            logger.info(f"[OK] Provided URL is already a product page: {url}")
+            return url
+
+        # URL is not a product page, navigate through categories to find products
+        logger.info("[PRODUCT] URL is not a product page, navigating through categories...")
+        discovered_product = await self._navigate_to_product(url, domain, base_url)
+
+        if discovered_product:
+            logger.info(f"[OK] Discovered random product page: {discovered_product}")
+            return discovered_product
+
+        logger.warning("[WARN] Could not discover any product pages")
+        return None
+
+    async def _is_product_page(self, url: str) -> bool:
+        """
+        Determine if a URL is a product page by validating essential product elements.
+
+        A valid product page should have at least 3 out of 4 core elements:
+        1. Product title (h1)
+        2. Product description or details
+        3. Price
+        4. Add-to-cart/basket button
+
+        Also checks for product-specific URL patterns.
+
+        Args:
+            url: URL to check
+
+        Returns:
+            True if it's likely a product page, False otherwise
+        """
+        page = None
         try:
-            selected_urls = random.choices(urls, weights=weights, k=min(n, len(urls)))
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_selected = []
-            for url in selected_urls:
-                if url not in seen:
-                    seen.add(url)
-                    unique_selected.append(url)
-            
-            # If we got duplicates, fill up with remaining candidates
-            if len(unique_selected) < n:
-                remaining = [u for u in urls if u not in seen]
-                if remaining:
-                    unique_selected.extend(remaining[:n - len(unique_selected)])
-            
-            return unique_selected
-        except Exception as e:
-            logger.warning(f"[SELECTION] Weighted selection failed: {e}, falling back to simple random")
-            return random.sample(urls, min(n, len(urls)))
+            # Quick URL pattern check first (fast)
+            url_lower = url.lower()
 
-    def _quick_filter_non_products(self, urls: list) -> list:
-        """Quickly filter out obvious non-product URLs before validation.
-        
-        Returns:
-            List of (url, score) tuples sorted by score (highest first)
-        """
-        filtered = []
-        for url in urls:
-            score = self._score_product_url(url)
-            if score > -10:  # Keep URLs that aren't obviously bad
-                filtered.append((url, score))
+            # Exclude homepages (even if they have product schema for featured items)
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path = parsed.path.strip('/')
+            # Homepage if path is empty or just domain
+            if not path or path == '' or len(path.split('/')) == 0:
+                logger.debug(f"[PRODUCT] URL is homepage, not a product page")
+                return False
 
-        # Sort by score (highest first)
-        filtered.sort(key=lambda x: x[1], reverse=True)
-        return filtered  # Return tuples with scores for weighted selection
+            # Exclude non-product patterns
+            for pattern in settings.non_product_patterns:
+                if pattern in url_lower:
+                    logger.debug(f"[PRODUCT] URL contains non-product pattern: {pattern}")
+                    return False
 
-    async def _discover_category_urls(self, page, base_url: str) -> list:
-        """
-        Discover category/collection URLs from homepage.
+            # Positive URL patterns that suggest product page (e.g., underscore+numbers: _769926)
+            import re
+            has_product_url_pattern = bool(re.search(r'_\d{5,}|/p/\d+|/product/|/produkt/', url_lower))
 
-        Args:
-            page: Playwright page object
-            base_url: Base URL of the site
+            # Open page to check content
+            page = await self.browser.new_page()
+            page.set_default_timeout(10000)  # 10 second timeout for faster checks
+            await page.goto(url, wait_until="domcontentloaded", timeout=10000)
 
-        Returns:
-            List of category URLs
-        """
-        category_selectors = [
-            # Navigation patterns
-            "nav a[href*='/category/']",
-            "nav a[href*='/categories/']",
-            "nav a[href*='/collection/']",
-            "nav a[href*='/shop/']",
-            "nav a[href*='/produkter/']",
-            "nav a[href*='/category']",
-            # Menu patterns
-            "[class*='menu'] a[href^='/']",
-            "[class*='nav'] a[href^='/']",
-            "[class*='category'] a[href]",
-            "[class*='collection'] a[href]",
-            # Specific for Danish sites
-            "a[href*='/hudpleje/']",
-            "a[href*='/makeup/']",
-            "a[href*='/parfume/']",
-            "a[href*='/haar/']",
-        ]
-
-        categories = []
-        for selector in category_selectors:
+            # Wait for dynamic content
             try:
-                elements = await page.query_selector_all(selector)
-                for elem in elements[:5]:  # Limit per selector
-                    href = await elem.get_attribute("href")
-                    if href and not href.startswith(("#", "javascript:", "mailto:")):
-                        full_url = urljoin(base_url, href)
-                        if full_url not in categories and full_url != base_url:
-                            # Avoid overly generic URLs
-                            if not any(
-                                x in full_url.lower()
-                                for x in ["/about", "/contact", "/login", "/register", "/cart", "/checkout"]
-                            ):
-                                categories.append(full_url)
-            except Exception as e:
-                logger.debug(f"Category selector '{selector}' failed: {e}")
+                await page.wait_for_timeout(1500)
+            except:
+                pass
 
-        # Deduplicate and limit
-        unique_categories = list(dict.fromkeys(categories))[:10]  # Top 10 categories
-        logger.info(f"[CATEGORY] Found {len(unique_categories)} potential category URLs")
-        return unique_categories
+            # Element 1: Product Title (h1)
+            title_found = False
+            title_selectors = [
+                'h1',
+                '[itemprop="name"]',
+                '[class*="product"][class*="title"]',
+                '[class*="product"][class*="name"]',
+                '[data-testid*="title"]',
+                '[data-testid*="name"]',
+                '[data-test*="product-title"]',
+            ]
+            for selector in title_selectors:
+                try:
+                    elem = await page.query_selector(selector)
+                    if elem:
+                        text = await elem.inner_text()
+                        if text and len(text.strip()) > 5:  # Must have meaningful content
+                            title_found = True
+                            logger.debug(f"[PRODUCT] ✓ Found title: {text.strip()[:50]}")
+                            break
+                except:
+                    continue
 
-    async def discover_product_url(self, url: str, max_retries: int = 2) -> Optional[str]:
+            # Element 2: Product Description or Details
+            description_found = False
+            description_selectors = [
+                '[itemprop="description"]',
+                '[class*="description"]',
+                '[class*="product-detail"]',
+                '[class*="product-info"]',
+                '[data-testid*="description"]',
+                '[data-test*="description"]',
+                'meta[name="description"]',
+                'meta[property="og:description"]',
+            ]
+            for selector in description_selectors:
+                try:
+                    elem = await page.query_selector(selector)
+                    if elem:
+                        if selector.startswith('meta'):
+                            text = await elem.get_attribute('content')
+                        else:
+                            text = await elem.inner_text()
+                        if text and len(text.strip()) > 10:  # Must have meaningful content
+                            description_found = True
+                            logger.debug(f"[PRODUCT] ✓ Found description")
+                            break
+                except:
+                    continue
+
+            # Element 3: Price
+            price_found = False
+            # Try structured data first (most reliable)
+            try:
+                structured_price = await page.evaluate("""() => {
+                    const priceEl = document.querySelector('[itemprop="price"]');
+                    if (priceEl) {
+                        const content = priceEl.getAttribute('content') || priceEl.innerText;
+                        return content;
+                    }
+                    return null;
+                }""")
+                if structured_price:
+                    price_found = True
+                    logger.debug(f"[PRODUCT] ✓ Found structured price: {structured_price}")
+            except:
+                pass
+
+            # Fallback to class-based selectors
+            if not price_found:
+                price_selectors = [
+                    '[class*="price"]:not([class*="old"]):not([class*="original"])',
+                    '[data-testid*="price"]',
+                    '[data-test*="price"]',
+                    'span[class*="Price"]',
+                    '[class*="product-price"]',
+                ]
+                for selector in price_selectors:
+                    try:
+                        elem = await page.query_selector(selector)
+                        if elem:
+                            text = await elem.inner_text()
+                            # Must contain currency or number
+                            if any(c in text for c in ["$", "€", "£", "kr", "DKK", "SEK", "NOK"]) or \
+                               any(char.isdigit() for char in text):
+                                price_found = True
+                                logger.debug(f"[PRODUCT] ✓ Found price: {text.strip()[:30]}")
+                                break
+                    except:
+                        continue
+
+            # Element 4: Add-to-cart/basket button
+            add_to_cart_found = False
+            for selector in settings.add_to_cart_selectors[:25]:
+                try:
+                    button = await page.query_selector(selector)
+                    if button:
+                        # Check if visible
+                        is_visible = await button.is_visible()
+                        if is_visible:
+                            add_to_cart_found = True
+                            logger.debug("[PRODUCT] ✓ Found add-to-cart button")
+                            break
+                except:
+                    continue
+
+            await page.close()
+
+            # Count how many indicators we found
+            indicators = sum([title_found, description_found, price_found, add_to_cart_found])
+
+            # Decision: Need at least 3 out of 4 indicators, OR 2 indicators + product URL pattern
+            is_product = (indicators >= 3) or (indicators >= 2 and has_product_url_pattern)
+
+            if is_product:
+                logger.info(f"[PRODUCT] [OK] Valid product page ({indicators}/4 indicators, URL pattern: {has_product_url_pattern}) - title: {title_found}, desc: {description_found}, price: {price_found}, cart: {add_to_cart_found}")
+            else:
+                missing = []
+                if not title_found: missing.append("title")
+                if not description_found: missing.append("description")
+                if not price_found: missing.append("price")
+                if not add_to_cart_found: missing.append("add-to-cart")
+                logger.debug(f"[PRODUCT] ✗ Not a valid product page ({indicators}/4 indicators, URL pattern: {has_product_url_pattern}) - Missing: {missing}")
+
+            return is_product
+
+        except PlaywrightTimeoutError:
+            logger.debug("[PRODUCT] Timeout checking page")
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
+            return False
+        except Exception as e:
+            logger.debug(f"[PRODUCT] Error checking page: {str(e)[:100]}")
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
+            return False
+
+    async def _discover_random_product(
+        self,
+        url: str,
+        domain: str,
+        base_url: str,
+        max_attempts: int = 3
+    ) -> Optional[str]:
         """
-        Discover a product URL from the homepage.
-        Uses intelligent filtering, scoring, and validation.
+        Discover a random product page from the website.
+
+        Strategy:
+        1. Scan the provided URL for product links
+        2. If none found, explore category/collection pages
+        3. Score and filter candidates
+        4. Randomly select from valid products (avoiding previously selected)
+        5. Validate the selected product page
 
         Args:
-            url: Homepage URL
-            max_retries: Maximum retry attempts
+            url: Starting URL to scan
+            domain: Website domain
+            base_url: Base URL of the site
+            max_attempts: Maximum discovery attempts
 
         Returns:
-            Product URL or None
+            Random product page URL or None
         """
-        for attempt in range(max_retries):
+        for attempt in range(max_attempts):
+            logger.info(f"[DISCOVERY] Attempt {attempt + 1}/{max_attempts}")
+
             page = None
             try:
                 page = await self.browser.new_page()
                 page.set_default_timeout(self.timeout)
-
-                logger.info(f"Discovering products (attempt {attempt + 1}/{max_retries})...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
 
-                # STEP 1: Quick check for schema.org Product markup
+                # Wait for dynamic content and scroll to trigger lazy-loading
                 try:
-                    schema_products = await page.query_selector_all('[itemtype*="schema.org/Product"]')
-                    if schema_products:
-                        logger.info(f"[SCHEMA] Found {len(schema_products)} schema.org Product elements")
-                        for elem in schema_products[:3]:  # Check first 3
-                            link = await elem.query_selector("a[href]")
-                            if link:
-                                href = await link.get_attribute("href")
-                                if href:
-                                    full_url = urljoin(url, href)
-                                    logger.info(f"[SCHEMA] Found product via schema.org: {full_url}")
-                                    await page.close()
-                                    return full_url
+                    await page.wait_for_timeout(2000)  # Wait 2s for JavaScript
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await page.wait_for_timeout(1000)  # Wait for lazy-load
                 except Exception as e:
-                    logger.debug(f"Schema.org check failed: {e}")
+                    logger.debug(f"[DISCOVERY] Scroll/wait error: {e}")
 
-                # STEP 2: Collect all product links with progressive selectors
-                selector_groups = [
-                    # Group 1: High-confidence product patterns
-                    [
-                        "a[href*='/product/']",
-                        "a[href*='/products/']",
-                        "a[href*='/p/']",
-                        "a[href*='/item/']",
-                        "a[href*='/vare/']",
-                        "a[href*='/catalogue/']",
-                        "a[href*='/pd/']",
-                    ],
-                    # Group 2: Product container patterns
-                    [
-                        ".product-item a[href]",
-                        ".product-card a[href]",
-                        "[class*='product'] a[href]",
-                        "article a[href]",
-                        ".item a[href]",
-                        "[data-product-id] a[href]",
-                    ],
-                    # Group 3: Semantic areas
-                    [
-                        "main a[href^='/']",
-                        "[role='main'] a[href^='/']",
-                        ".content a[href^='/']",
-                    ],
-                ]
+                # Collect product link candidates
+                candidates = await self._collect_product_candidates(page, base_url)
 
-                all_candidates = []
-
-                for group_idx, selectors in enumerate(selector_groups):
-                    logger.info(f"[DISCOVER] Scanning selector group {group_idx + 1}/{len(selector_groups)}")
-
-                    for selector in selectors:
-                        try:
-                            elements = await page.query_selector_all(selector)
-                            if elements:
-                                logger.debug(f"[DISCOVER] Found {len(elements)} links with '{selector}'")
-                                for elem in elements:
-                                    href = await elem.get_attribute("href")
-                                    if href and not href.startswith(("#", "javascript:", "mailto:")):
-                                        full_url = urljoin(url, href)
-                                        if full_url not in all_candidates and full_url != url:
-                                            all_candidates.append(full_url)
-                        except Exception as e:
-                            logger.debug(f"Selector '{selector}' failed: {e}")
-
-                    # If we found good candidates in this group, don't need to go broader
-                    if len(all_candidates) >= 10 and group_idx == 0:
-                        logger.info(
-                            f"[DISCOVER] Found {len(all_candidates)} high-confidence candidates, skipping broader search"
-                        )
-                        break
-                    elif len(all_candidates) >= 20:
-                        logger.info(f"[DISCOVER] Found {len(all_candidates)} candidates, proceeding to validation")
-                        break
-
-                if not all_candidates:
-                    logger.warning(f"No product link candidates found on attempt {attempt + 1}")
-                    await page.close()
-                    if attempt < max_retries - 1:
-                        continue
-                    return None
-
-                logger.info(f"[DISCOVER] Found {len(all_candidates)} total link candidates")
-
-                # STEP 3: Filter obvious non-products and score
-                filtered_candidates = self._quick_filter_non_products(all_candidates)
-                logger.info(
-                    f"[FILTER] {len(filtered_candidates)} candidates after filtering (removed {len(all_candidates) - len(filtered_candidates)})"
-                )
-
-                if not filtered_candidates:
-                    logger.warning("All candidates filtered out as non-products")
-                    await page.close()
-                    if attempt < max_retries - 1:
-                        continue
-                    return None
+                if not candidates:
+                    logger.info("[DISCOVERY] No candidates on main page, trying categories...")
+                    # Try category pages
+                    category_candidates = await self._explore_categories(page, base_url, domain)
+                    candidates.extend(category_candidates)
 
                 await page.close()
+                page = None
 
-                # STEP 4: Validate top candidates with improved random selection
-                # Expand pool size for more variety (30-50 instead of 10)
-                pool_size = min(50, len(filtered_candidates))
-                top_candidates = filtered_candidates[:pool_size]
-                
-                # Get domain for URL history tracking
-                parsed = urlparse(url)
-                domain = parsed.netloc
-                
-                # Filter out previously selected URLs to ensure variety
-                new_candidates = self._filter_previously_selected(domain, top_candidates)
-                
-                # If all candidates were previously selected, use the original pool
-                if not new_candidates:
-                    logger.info(f"[SELECTION] All top candidates were previously selected, using full pool")
-                    new_candidates = top_candidates
-                
-                # Use weighted random selection (higher scores = higher probability)
-                max_to_validate = min(settings.max_validation_attempts, len(new_candidates))
-                candidates_to_check = self._weighted_random_selection(new_candidates, max_to_validate)
-                
-                logger.info(
-                    f"[VALIDATION] Selected {len(candidates_to_check)} candidates from pool of {len(new_candidates)} (filtered from {pool_size} total)"
-                )
+                if not candidates:
+                    logger.warning(f"[DISCOVERY] No product candidates found (attempt {attempt + 1})")
+                    if attempt < max_attempts - 1:
+                        continue
+                    return None
 
-                for idx, candidate_url in enumerate(candidates_to_check):
-                    logger.info(f"[VALIDATION] Checking candidate {idx + 1}/{max_to_validate}: {candidate_url}")
-                    if await self._is_valid_product_page(candidate_url):
-                        logger.info(f" Discovered valid product URL: {candidate_url}")
-                        # Mark this URL as selected to avoid repeating it in future runs
-                        self._mark_url_as_selected(domain, candidate_url)
-                        return candidate_url
+                logger.info(f"[DISCOVERY] Found {len(candidates)} product candidates")
 
-                logger.warning(f"No valid product pages found after validating {max_to_validate} candidates")
+                # Score and filter candidates
+                scored_candidates = self._score_and_filter_candidates(candidates, domain)
 
-                # STEP 5: If no products found, try navigating to categories
-                logger.info("[CATEGORY] No products on homepage, attempting category navigation...")
+                if not scored_candidates:
+                    logger.warning("[DISCOVERY] All candidates filtered out")
+                    if attempt < max_attempts - 1:
+                        continue
+                    return None
 
-                # Re-open page for category discovery
-                category_page = await self.browser.new_page()
-                category_page.set_default_timeout(self.timeout)
-                await category_page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                # Select random product (avoiding previously selected)
+                selected_product = self._select_random_product(scored_candidates, domain)
 
-                category_urls = await self._discover_category_urls(category_page, url)
-                await category_page.close()
+                if not selected_product:
+                    logger.warning("[DISCOVERY] No new products available")
+                    if attempt < max_attempts - 1:
+                        continue
+                    return None
 
-                if category_urls:
-                    logger.info(f"[CATEGORY] Found {len(category_urls)} categories, randomly checking 3...")
-
-                    # Randomly select 3 categories to check
-                    num_categories_to_check = min(3, len(category_urls))
-                    selected_categories = random.sample(category_urls, num_categories_to_check)
-
-                    # Try each selected category
-                    for cat_idx, category_url in enumerate(selected_categories):
-                        logger.info(
-                            f"[CATEGORY] Checking category {cat_idx + 1}/{num_categories_to_check}: {category_url}"
-                        )
-
-                        try:
-                            cat_page = await self.browser.new_page()
-                            cat_page.set_default_timeout(self.timeout)
-                            await cat_page.goto(category_url, wait_until="domcontentloaded", timeout=self.timeout)
-
-                            # Look for products on category page
-                            cat_candidates = []
-                            product_selectors = [
-                                ".product-item a[href]",
-                                ".product-card a[href]",
-                                "[class*='product'] a[href]",
-                                "article a[href]",
-                            ]
-
-                            for selector in product_selectors:
-                                try:
-                                    elements = await cat_page.query_selector_all(selector)
-                                    if elements:
-                                        logger.debug(f"[CATEGORY] Found {len(elements)} links with '{selector}'")
-                                        for elem in elements[:20]:  # Limit to 20 per selector
-                                            href = await elem.get_attribute("href")
-                                            if href and not href.startswith(("#", "javascript:", "mailto:")):
-                                                full_url = urljoin(category_url, href)
-                                                if full_url not in cat_candidates and full_url != category_url:
-                                                    cat_candidates.append(full_url)
-                                except Exception as e:
-                                    logger.debug(f"Category selector '{selector}' failed: {e}")
-
-                            await cat_page.close()
-
-                            if cat_candidates:
-                                # Filter and validate category candidates using improved selection logic
-                                filtered_cat = self._quick_filter_non_products(cat_candidates)
-                                logger.info(f"[CATEGORY] Found {len(filtered_cat)} product candidates in category")
-
-                                # Use improved selection logic for category products too
-                                pool_size = min(30, len(filtered_cat))
-                                top_cat_candidates = filtered_cat[:pool_size]
-                                
-                                # Filter out previously selected URLs
-                                new_cat_candidates = self._filter_previously_selected(domain, top_cat_candidates)
-                                if not new_cat_candidates:
-                                    new_cat_candidates = top_cat_candidates
-                                
-                                # Use weighted random selection
-                                num_to_validate = min(3, len(new_cat_candidates))
-                                cat_products_to_check = self._weighted_random_selection(new_cat_candidates, num_to_validate)
-
-                                for prod_idx, candidate_url in enumerate(cat_products_to_check):
-                                    logger.info(
-                                        f"[CATEGORY] Validating product {prod_idx + 1}/{num_to_validate}: {candidate_url}"
-                                    )
-                                    if await self._is_valid_product_page(candidate_url):
-                                        logger.info(f" Discovered product via category navigation: {candidate_url}")
-                                        # Mark this URL as selected
-                                        self._mark_url_as_selected(domain, candidate_url)
-                                        return candidate_url
-
-                        except Exception as e:
-                            logger.debug(f"Error checking category {category_url}: {e}")
-                            continue
-
-                    logger.warning("No valid products found in any category pages")
+                # Validate the selected product
+                logger.info(f"[DISCOVERY] Validating selected product: {selected_product}")
+                if await self._is_product_page(selected_product):
+                    # Mark as selected for future variety
+                    self._mark_as_selected(domain, selected_product)
+                    return selected_product
                 else:
-                    logger.warning("No category URLs found on homepage")
+                    logger.debug("[DISCOVERY] Selected URL failed validation, retrying...")
+                    if attempt < max_attempts - 1:
+                        continue
 
-                if attempt < max_retries - 1:
-                    logger.info("Retrying product discovery...")
-                    continue
-
-                return None
-
-            except PlaywrightTimeoutError:
-                logger.warning(f"Timeout discovering products on attempt {attempt + 1}")
-                if page:
-                    try:
-                        await page.close()
-                    except:
-                        pass
-                if attempt < max_retries - 1:
-                    continue
-                return None
             except Exception as e:
-                logger.error(f"Error discovering product URL (attempt {attempt + 1}): {e}")
-                logger.debug(f"Stack trace: {traceback.format_exc()}")
+                logger.error(f"[DISCOVERY] Error: {str(e)[:200]}")
+                logger.debug(traceback.format_exc())
                 if page:
                     try:
                         await page.close()
                     except:
                         pass
-                if attempt < max_retries - 1:
+                if attempt < max_attempts - 1:
                     continue
-                return None
 
         return None
 
-    async def detect_universal_selectors(self, url: str) -> Dict[str, Optional[str]]:
+    async def _navigate_to_product(
+        self,
+        url: str,
+        domain: str,
+        base_url: str,
+        max_depth: int = 5
+    ) -> Optional[str]:
         """
-        Detect universal selectors for product page with error handling.
+        Navigate through categories to find a product page.
+
+        NEW STRATEGY (improved for sites like matas.dk):
+        1. Check if current URL is a product page
+        2. If not, look for categories
+        3. Select a random category and navigate to it
+        4. Check for product listings (items with title + price)
+        5. If product listings found, randomly select one and check if it's a product page
+        6. If no product listings (might be sub-categories), go deeper into sub-categories
+        7. Repeat until finding a valid product page
+
+        Args:
+            url: Starting URL
+            domain: Website domain
+            base_url: Base URL of the site
+            max_depth: Maximum navigation depth
+
+        Returns:
+            Product page URL or None
+        """
+        current_url = url
+        page = None
+
+        try:
+            page = await self.browser.new_page()
+            page.set_default_timeout(self.timeout)
+
+            for depth in range(max_depth):
+                logger.info(f"[NAVIGATE] Depth {depth + 1}/{max_depth} - Current URL: {current_url}")
+
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=self.timeout)
+
+                # Wait for dynamic content
+                try:
+                    await page.wait_for_timeout(2000)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await page.wait_for_timeout(1000)
+                except Exception as e:
+                    logger.debug(f"[NAVIGATE] Scroll/wait error: {e}")
+
+                # STEP 1: Check if current page is already a product page
+                if await self._is_product_page(current_url):
+                    logger.info(f"[NAVIGATE] [OK] Found product page at depth {depth + 1}")
+                    self._mark_as_selected(domain, current_url)
+                    return current_url
+
+                # STEP 2: Not a product page - look for PRODUCT LISTINGS (items with title + price)
+                logger.info(f"[NAVIGATE] Not a product page, looking for product listings...")
+
+                product_listings = await self._find_product_listings(page)
+
+                if product_listings:
+                    # Found product listings! Select one randomly
+                    logger.info(f"[NAVIGATE] Found {len(product_listings)} product listings")
+                    selected_product = random.choice(product_listings)
+                    logger.info(f"[NAVIGATE] Selected product: {selected_product[:80]}")
+                    current_url = selected_product
+                    # Continue to next depth to verify it's a product page
+                    continue
+
+                # STEP 3: No product listings found - look for CATEGORY/SUB-CATEGORY links
+                logger.info(f"[NAVIGATE] No product listings, looking for categories/sub-categories...")
+
+                category_links = await self._find_category_links(page, domain)
+
+                if category_links:
+                    # Found categories/sub-categories - select one randomly
+                    logger.info(f"[NAVIGATE] Found {len(category_links)} category links")
+                    selected_category = random.choice(category_links)
+                    logger.info(f"[NAVIGATE] Selected category: {selected_category[:80]}")
+                    current_url = selected_category
+                    # Continue to next depth
+                    continue
+
+                # STEP 4: Nothing found at all
+                logger.warning(f"[NAVIGATE] No product listings or categories found at depth {depth + 1}")
+                return None
+
+            logger.warning(f"[NAVIGATE] Max depth {max_depth} reached without finding product page")
+            return None
+
+        except Exception as e:
+            logger.error(f"[NAVIGATE] Navigation error: {e}")
+            return None
+
+        finally:
+            if page:
+                await page.close()
+
+    async def _find_product_listings(self, page: Page) -> List[str]:
+        """
+        Find product listings on current page.
+        A product listing MUST have both title AND price.
+
+        Returns:
+            List of product URLs
+        """
+        product_urls = []
+
+        try:
+            # Find all elements that contain BOTH product info and price
+            products = await page.evaluate("""() => {
+                const results = [];
+
+                // Look for common product listing containers
+                const containerSelectors = [
+                    '[class*="product"]',
+                    '[class*="item"]',
+                    '[data-product]',
+                    'article',
+                    'li[class*="product"]',
+                    'div[class*="card"]'
+                ];
+
+                const containers = [];
+                containerSelectors.forEach(sel => {
+                    try {
+                        document.querySelectorAll(sel).forEach(el => containers.push(el));
+                    } catch(e) {}
+                });
+
+                containers.forEach(container => {
+                    // Must have a link
+                    const link = container.querySelector('a[href]');
+                    if (!link || !link.href || !link.href.startsWith('http')) {
+                        return;
+                    }
+
+                    // Must have price indicator
+                    const priceKeywords = /kr|dkk|€|\\$|price|pris/i;
+                    const priceElements = container.querySelectorAll('*');
+                    let hasPrice = false;
+
+                    for (let el of priceElements) {
+                        const text = el.textContent || '';
+                        if (priceKeywords.test(text) && /\\d+/.test(text)) {
+                            hasPrice = true;
+                            break;
+                        }
+                    }
+
+                    // Must have some text content (product title/name)
+                    const text = container.textContent || '';
+                    const hasContent = text.trim().length > 20 && text.trim().length < 500;
+
+                    if (hasPrice && hasContent && link.href) {
+                        results.push(link.href);
+                    }
+                });
+
+                return [...new Set(results)];
+            }""")
+
+            product_urls = products[:50]  # Limit to 50
+
+        except Exception as e:
+            logger.debug(f"[NAVIGATE] Error finding product listings: {e}")
+
+        return product_urls
+
+    async def _find_category_links(self, page: Page, domain: str) -> List[str]:
+        """
+        Find category/sub-category links on current page.
+
+        Returns:
+            List of category URLs
+        """
+        category_urls = []
+
+        try:
+            # Find navigation links, menu items, category links
+            categories = await page.evaluate("""() => {
+                const results = [];
+
+                // Look for navigation/menu links
+                const selectors = [
+                    'nav a[href]',
+                    '[class*="menu"] a[href]',
+                    '[class*="category"] a[href]',
+                    '[class*="nav"] a[href]',
+                    '[role="navigation"] a[href]',
+                    'header a[href]',
+                    'a[class*="category"]',
+                    'ul[class*="menu"] a',
+                    'ul[class*="nav"] a'
+                ];
+
+                const links = new Set();
+
+                selectors.forEach(sel => {
+                    try {
+                        document.querySelectorAll(sel).forEach(link => {
+                            if (link.href && link.href.startsWith('http')) {
+                                // Filter out: contact, about, policy, cart, checkout, account
+                                const text = (link.textContent || '').toLowerCase();
+                                const href = link.href.toLowerCase();
+                                const exclude = ['kontakt', 'om', 'about', 'policy', 'privacy', 'cart', 'kurv', 'checkout', 'kassen', 'login', 'konto', 'account'];
+
+                                if (!exclude.some(word => text.includes(word) || href.includes(word))) {
+                                    links.add(link.href);
+                                }
+                            }
+                        });
+                    } catch(e) {}
+                });
+
+                return Array.from(links);
+            }""")
+
+            # Filter to same domain
+            category_urls = [url for url in categories if domain in url][:30]
+
+        except Exception as e:
+            logger.debug(f"[NAVIGATE] Error finding category links: {e}")
+
+        return category_urls
+
+    async def _collect_product_candidates(self, page: Page, base_url: str) -> List[str]:
+        """
+        Collect potential product page URLs from the current page.
+
+        Uses progressive selector strategy:
+        1. High-confidence product URL patterns
+        2. Product container patterns
+        3. Semantic areas and general links
+
+        Args:
+            page: Playwright page object
+            base_url: Base URL for resolving relative links
+
+        Returns:
+            List of candidate URLs
+        """
+        candidates = []
+
+        # Strategy 1: Schema.org Product links (highest confidence)
+        try:
+            schema_products = await page.query_selector_all('[itemtype*="schema.org/Product"]')
+            for elem in schema_products[:10]:
+                link = await elem.query_selector("a[href]")
+                if link:
+                    href = await link.get_attribute("href")
+                    if href and not href.startswith(("#", "javascript:", "mailto:")):
+                        full_url = urljoin(base_url, href)
+                        if full_url not in candidates:
+                            candidates.append(full_url)
+                            logger.debug(f"[COLLECT] Schema.org product: {full_url}")
+        except:
+            pass
+
+        # Strategy 2: Product URL patterns in links
+        product_href_selectors = [
+            "a[href*='/product/']",
+            "a[href*='/products/']",
+            "a[href*='/p/']",
+            "a[href*='/item/']",
+            "a[href*='/vare/']",
+            "a[href*='/catalogue/']",
+            "a[href*='/catalog/']",
+        ]
+
+        for selector in product_href_selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+                for elem in elements[:20]:  # Limit per selector
+                    href = await elem.get_attribute("href")
+                    if href and not href.startswith(("#", "javascript:", "mailto:")):
+                        full_url = urljoin(base_url, href)
+                        if full_url not in candidates:
+                            candidates.append(full_url)
+            except:
+                pass
+
+        # Strategy 3: Product container patterns (more aggressive)
+        if len(candidates) < 10:
+            container_selectors = [
+                ".product-item a[href]",
+                ".product-card a[href]",
+                "[class*='product'] a[href]",
+                "article a[href]",
+                "[data-product-id] a[href]",
+                "[class*='item'] a[href]",
+                ".grid a[href]",
+                "[class*='tile'] a[href]",
+            ]
+
+            for selector in container_selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    for elem in elements[:25]:
+                        href = await elem.get_attribute("href")
+                        if href and not href.startswith(("#", "javascript:", "mailto:")):
+                            full_url = urljoin(base_url, href)
+                            if full_url not in candidates:
+                                candidates.append(full_url)
+                except:
+                    pass
+
+        # Strategy 4: Look for links with product-related keywords in images
+        if len(candidates) < 10:
+            try:
+                image_links = await page.query_selector_all("a:has(img)")
+                for elem in image_links[:40]:
+                    href = await elem.get_attribute("href")
+                    if href and not href.startswith(("#", "javascript:", "mailto:")):
+                        full_url = urljoin(base_url, href)
+                        # Strict filtering - must not match non-product patterns
+                        excluded_patterns = ["/blog", "/story", "/stories", "/gaver", "/gifts", "/influencer", "/inspiration", "/guide", "/campaign"]
+                        if full_url not in candidates and not any(p in full_url.lower() for p in excluded_patterns):
+                            # Must have reasonable path depth
+                            if 3 <= full_url.count("/") <= 6:
+                                candidates.append(full_url)
+            except:
+                pass
+
+        logger.info(f"[COLLECT] Collected {len(candidates)} total candidates")
+        return candidates
+
+    async def _explore_categories(
+        self,
+        page: Page,
+        base_url: str,
+        domain: str
+    ) -> List[str]:
+        """
+        Explore category/collection pages to find products.
+
+        Args:
+            page: Playwright page object (currently on homepage)
+            base_url: Base URL of the site
+            domain: Website domain
+
+        Returns:
+            List of product candidate URLs from categories
+        """
+        candidates = []
+
+        # Find category/collection URLs - cast wider net
+        category_selectors = [
+            "nav a[href*='/category/']",
+            "nav a[href*='/collection/']",
+            "nav a[href*='/shop/']",
+            "nav a[href*='/produkter/']",
+            "nav a[href^='/']",  # Any navigation link
+            "[class*='menu'] a[href^='/']",
+            "[class*='nav'] a[href^='/']",
+            "[class*='category'] a[href^='/']",
+            "header a[href^='/']",  # Header links often lead to categories
+        ]
+
+        category_urls = []
+        for selector in category_selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+                for elem in elements[:8]:
+                    href = await elem.get_attribute("href")
+                    if href and not href.startswith(("#", "javascript:", "mailto:")):
+                        full_url = urljoin(base_url, href)
+                        # Filter out non-category URLs - be more restrictive
+                        excluded = ["/about", "/contact", "/cart", "/checkout", "/gaver", "/gifts", "/story", "/stories", "/influencer", "/blog", "/inspiration", "/campaign"]
+                        if not any(p in full_url.lower() for p in excluded):
+                            # Must look like a category (reasonable depth, not too specific)
+                            if full_url not in category_urls and 3 <= full_url.count("/") <= 5:
+                                category_urls.append(full_url)
+            except:
+                pass
+
+        if not category_urls:
+            logger.debug("[CATEGORY] No category URLs found")
+            return candidates
+
+        logger.info(f"[CATEGORY] Found {len(category_urls)} category URLs, exploring...")
+
+        # Randomly sample up to 5 categories (increased from 3)
+        sample_size = min(5, len(category_urls))
+        selected_categories = random.sample(category_urls, sample_size)
+
+        for cat_url in selected_categories:
+            try:
+                cat_page = await self.browser.new_page()
+                cat_page.set_default_timeout(10000)
+                await cat_page.goto(cat_url, wait_until="domcontentloaded", timeout=10000)
+
+                # Collect products from category page
+                cat_candidates = await self._collect_product_candidates(cat_page, base_url)
+
+                # Filter out obvious non-products from category results
+                excluded_patterns = ["/stories", "/story", "/gaver", "/gifts", "/influencer", "/campaign", "/fast-lav-pris"]
+                filtered_cat = [
+                    url for url in cat_candidates
+                    if not any(p in url.lower() for p in excluded_patterns)
+                ]
+
+                candidates.extend(filtered_cat)
+
+                await cat_page.close()
+
+                logger.info(f"[CATEGORY] Found {len(filtered_cat)} potential products in {cat_url}")
+
+                # Stop early if we found enough candidates
+                if len(candidates) >= 20:
+                    logger.info(f"[CATEGORY] Found enough candidates ({len(candidates)}), stopping category exploration")
+                    break
+
+            except Exception as e:
+                logger.debug(f"[CATEGORY] Error exploring {cat_url}: {str(e)[:100]}")
+                continue
+
+        return candidates
+
+    def _score_and_filter_candidates(
+        self,
+        candidates: List[str],
+        domain: str
+    ) -> List[Tuple[str, float]]:
+        """
+        Score and filter product candidates.
+
+        Scoring factors:
+        - URL patterns (product/, item/, etc.)
+        - Product ID patterns
+        - Negative patterns (blog/, category/, etc.)
+
+        Args:
+            candidates: List of candidate URLs
+            domain: Website domain
+
+        Returns:
+            List of (url, score) tuples, sorted by score descending
+        """
+        scored = []
+
+        for url in candidates:
+            score = 0.0
+            url_lower = url.lower()
+
+            # Positive patterns
+            if any(p in url_lower for p in ["/product/", "/products/", "/p/", "/item/"]):
+                score += 20
+            elif any(p in url_lower for p in ["/vare/", "/catalogue/", "/catalog/"]):
+                score += 15
+
+            # Product ID pattern (strong indicator)
+            if re.search(r"/\d{4,}", url) or re.search(r"[-_]\d{4,}", url):
+                score += 15
+
+            # Has hyphenated product name pattern (e.g., /brand-name/product-name-variant)
+            # Common in modern e-commerce sites
+            path_parts = url_lower.split('/')
+            if len(path_parts) >= 2:
+                last_part = path_parts[-1]
+                # Check if last part looks like a product slug (multiple hyphens, reasonable length)
+                if last_part.count('-') >= 2 and 10 <= len(last_part) <= 100:
+                    score += 10
+
+            # Negative patterns (disqualify)
+            # Match both /pattern/, /pattern-, pattern/ at start/middle/end of path
+            for pattern in settings.non_product_patterns:
+                clean_pattern = pattern.strip('/')
+                # Check if pattern appears anywhere in the URL path
+                # Matches: /pattern/, /pattern-, -pattern/, -pattern-, /pattern (end of URL)
+                if f"/{clean_pattern}/" in url_lower or \
+                   f"/{clean_pattern}-" in url_lower or \
+                   f"-{clean_pattern}/" in url_lower or \
+                   f"-{clean_pattern}-" in url_lower or \
+                   url_lower.endswith(f"/{clean_pattern}"):
+                    score -= 100
+                    logger.debug(f"[FILTER] Rejected {url} due to pattern: {pattern}")
+                    break
+
+            # Must have reasonable path depth
+            if url.count("/") >= 3:
+                score += 5
+
+            # Add small randomness for variety
+            score += random.uniform(0, 3)
+
+            # Only keep candidates with positive scores
+            if score > 0:
+                scored.append((url, score))
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        logger.info(f"[FILTER] {len(scored)} candidates after filtering (removed {len(candidates) - len(scored)})")
+
+        return scored
+
+    def _select_random_product(
+        self,
+        scored_candidates: List[Tuple[str, float]],
+        domain: str
+    ) -> Optional[str]:
+        """
+        Select a random product from scored candidates, avoiding previously selected ones.
+
+        Uses weighted random selection where higher-scored products have higher probability.
+
+        Args:
+            scored_candidates: List of (url, score) tuples
+            domain: Website domain
+
+        Returns:
+            Selected product URL or None
+        """
+        if not scored_candidates:
+            return None
+
+        # Filter out previously selected URLs
+        previously_selected = self._selected_products_cache.get(domain, set())
+        new_candidates = [(url, score) for url, score in scored_candidates if url not in previously_selected]
+
+        # If all were previously selected, reset and use all candidates
+        if not new_candidates:
+            logger.info("[SELECT] All candidates were previously selected, resetting cache")
+            new_candidates = scored_candidates
+
+        # Extract URLs and scores
+        urls = [url for url, _ in new_candidates]
+        scores = [score for _, score in new_candidates]
+
+        # Convert scores to weights (ensure positive)
+        min_score = min(scores)
+        offset = abs(min_score) + 1 if min_score < 0 else 0
+        weights = [score + offset for score in scores]
+
+        # Weighted random selection (top 30% of candidates for quality)
+        pool_size = max(1, int(len(new_candidates) * 0.3))
+        pool = new_candidates[:pool_size]
+        pool_urls = [url for url, _ in pool]
+        pool_weights = weights[:pool_size]
+
+        # Select one randomly
+        selected = random.choices(pool_urls, weights=pool_weights, k=1)[0]
+
+        logger.info(f"[SELECT] Selected from pool of {pool_size} candidates (out of {len(new_candidates)})")
+
+        return selected
+
+    def _mark_as_selected(self, domain: str, url: str):
+        """
+        Mark a URL as selected to ensure variety in future runs.
+
+        Args:
+            domain: Website domain
+            url: Selected product URL
+        """
+        if domain not in self._selected_products_cache:
+            self._selected_products_cache[domain] = set()
+
+        self._selected_products_cache[domain].add(url)
+
+        # Keep cache bounded (FIFO)
+        if len(self._selected_products_cache[domain]) > self._max_cache_size_per_domain:
+            cache_list = list(self._selected_products_cache[domain])
+            self._selected_products_cache[domain] = set(cache_list[1:])
+
+        logger.debug(f"[SELECT] Marked as selected (cache size: {len(self._selected_products_cache[domain])})")
+
+    async def _detect_selectors(self, url: str) -> Dict[str, Optional[str]]:
+        """
+        Detect universal selectors on the product page.
 
         Args:
             url: Product page URL
@@ -700,47 +1117,41 @@ class AnalyzerService:
             page.set_default_timeout(self.timeout)
             await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
 
-            # Detect title with error handling for each pattern
-            for pattern in ["//h1", "//h2", "//*[@class='title']"]:
+            # Detect title
+            title_patterns = ["//h1", "//h2", "//*[@class='title']"]
+            for pattern in title_patterns:
                 try:
-                    element = await page.query_selector(f"xpath={pattern}")
-                    if element:
+                    elem = await page.query_selector(f"xpath={pattern}")
+                    if elem:
                         selectors["title"] = pattern
-                        logger.info(f"[DETECT] Title selector: {pattern}")
+                        logger.info(f"[DETECT] Title: {pattern}")
                         break
-                except Exception as e:
-                    logger.debug(f"Title pattern '{pattern}' failed: {e}")
+                except:
+                    pass
 
-            # Detect price with error handling
-            for pattern in [
+            # Detect price
+            price_patterns = [
                 "//*[contains(@class, 'price') and not(contains(@class, 'old'))]",
                 "//*[@itemprop='price']",
                 "//*[contains(@class, 'product-price')]",
-            ]:
+            ]
+            for pattern in price_patterns:
                 try:
-                    element = await page.query_selector(f"xpath={pattern}")
-                    if element:
+                    elem = await page.query_selector(f"xpath={pattern}")
+                    if elem:
                         selectors["price"] = pattern
-                        logger.info(f"[DETECT] Price selector: {pattern}")
+                        logger.info(f"[DETECT] Price: {pattern}")
                         break
-                except Exception as e:
-                    logger.debug(f"Price pattern '{pattern}' failed: {e}")
+                except:
+                    pass
 
             await page.close()
 
             detected_count = sum(1 for v in selectors.values() if v)
-            logger.info(f"Detected {detected_count}/6 selectors")
+            logger.info(f"[DETECT] Detected {detected_count}/6 selectors")
 
-        except PlaywrightTimeoutError:
-            logger.warning("Timeout detecting selectors")
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
         except Exception as e:
-            logger.error(f"Error detecting selectors: {e}")
-            logger.debug(f"Stack trace: {traceback.format_exc()}")
+            logger.error(f"[DETECT] Error: {str(e)[:100]}")
             if page:
                 try:
                     await page.close()
@@ -749,183 +1160,27 @@ class AnalyzerService:
 
         return selectors
 
-    async def _is_valid_product_page(self, url: str) -> bool:
+    async def _check_robots_txt(self, base_url: str, url: str) -> Dict:
         """
-        Validate if a URL is an actual product page (not article/category/blog).
-        Enhanced with faster checks and better indicators.
+        Check robots.txt for scraping permissions.
+
+        Validates that critical paths (products, cart, checkout) are allowed.
 
         Args:
-            url: URL to validate
+            base_url: Base URL of the website
+            url: Current URL being analyzed
 
         Returns:
-            True if it's a valid product page, False otherwise
+            Dictionary with robots.txt analysis results
         """
-        page = None
-        try:
-            page = await self.browser.new_page()
-            # Shorter timeout for validation - fail fast on slow pages
-            page.set_default_timeout(8000)
-
-            await page.goto(url, wait_until="domcontentloaded", timeout=8000)
-
-            # Check 1: URL patterns that indicate non-product pages
-            url_lower = url.lower()
-            non_product_patterns = settings.non_product_patterns
-
-            for pattern in non_product_patterns:
-                if pattern in url_lower:
-                    logger.debug(f"[VALIDATION] URL contains non-product pattern '{pattern}'")
-                    await page.close()
-                    return False
-
-            # Check 2: Schema.org Product markup (strongest indicator)
-            try:
-                schema_product = await page.query_selector('[itemtype*="schema.org/Product"]')
-                if schema_product:
-                    logger.info(f"[VALIDATION] ✓ Found schema.org Product markup: {url}")
-                    await page.close()
-                    return True
-            except:
-                pass
-
-            # Check 3: JSON-LD structured data
-            try:
-                json_ld_script = await page.query_selector('script[type="application/ld+json"]')
-                if json_ld_script:
-                    content = await json_ld_script.inner_text()
-                    if '"@type":"Product"' in content or '"@type": "Product"' in content:
-                        logger.info(f"[VALIDATION] [OK] Found JSON-LD Product data: {url}")
-                        await page.close()
-                        return True
-            except:
-                pass
-
-            # Check 4: Look for add-to-cart button (strong indicator)
-            add_to_cart_selectors = settings.add_to_cart_selectors[:10]  # Use first 10 from config
-
-            for selector in add_to_cart_selectors:
-                try:
-                    button = await page.query_selector(selector)
-                    if button:
-                        is_visible = await button.is_visible()
-                        if is_visible:
-                            logger.info(f"[VALIDATION] [OK] Found visible add-to-cart button: {url}")
-                            await page.close()
-                            return True
-                except:
-                    continue
-
-            # Check 5: Look for price element with text validation
-            price_selectors = [
-                "[class*='price']:not([class*='old']):not([class*='original'])",
-                "[data-testid*='price']",
-                "[itemprop='price']",
-                ".woocommerce-Price-amount",
-                "span[class*='Price']",
-                "div[class*='price']",
-            ]
-
-            has_price = False
-            for selector in price_selectors:
-                try:
-                    price_elem = await page.query_selector(selector)
-                    if price_elem:
-                        text = await price_elem.inner_text()
-                        # Check if it contains currency symbols or "kr"
-                        if any(char in text for char in ["$", "€", "£", "kr", "DKK", "SEK", "NOK"]):
-                            has_price = True
-                            logger.debug(f"[VALIDATION] Found price: {text.strip()[:50]}")
-                            break
-                except:
-                    continue
-
-            # Check 6: Look for product-specific elements
-            product_indicators = [
-                "[class*='product-detail']",
-                "[class*='product-page']",
-                "[class*='product-info']",
-                "[id*='product']",
-                "[data-product-id]",
-                ".product-form",
-                "form[action*='cart']",
-                "form[action*='add']",
-            ]
-
-            has_product_indicator = False
-            for selector in product_indicators:
-                try:
-                    elem = await page.query_selector(selector)
-                    if elem:
-                        has_product_indicator = True
-                        logger.debug(f"[VALIDATION] Found product indicator: {selector}")
-                        break
-                except:
-                    continue
-
-            # Check 7: Look for product images (gallery pattern)
-            try:
-                images = await page.query_selector_all(
-                    'img[src*="product"], img[alt*="product"], .product-image img, [class*="gallery"] img'
-                )
-                has_product_images = len(images) >= 2  # Product pages typically have multiple images
-                if has_product_images:
-                    logger.debug(f"[VALIDATION] Found {len(images)} product-related images")
-            except:
-                has_product_images = False
-
-            await page.close()
-
-            # Scoring system: need at least 2 positive indicators
-            score = 0
-            if has_price:
-                score += 2
-            if has_product_indicator:
-                score += 1
-            if has_product_images:
-                score += 1
-
-            is_valid = score >= 2
-
-            if is_valid:
-                logger.info(f"[VALIDATION] [OK] Confirmed product page (score: {score}/4): {url}")
-            else:
-                logger.debug(f"[VALIDATION] [SKIP] Not a product page (score: {score}/4): {url}")
-
-            return is_valid
-
-        except PlaywrightTimeoutError:
-            logger.debug(f"[VALIDATION] Timeout validating (skipping): {url}")
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
-            return False
-        except Exception as e:
-            logger.debug(f"[VALIDATION] Error validating (assuming invalid): {str(e)[:100]}")
-            if page:
-                try:
-                    await page.close()
-                except:
-                    pass
-            return False
-
-    async def _check_robots_txt(self, base_url: str, url: str) -> Dict:
-        """Check robots.txt for scraping permissions with detailed path analysis"""
-        import urllib.robotparser
-        from urllib.parse import urljoin
-        import aiohttp
-        from pathlib import Path
-        from datetime import datetime
-
         robots_url = urljoin(base_url, "/robots.txt")
         logger.info(f"[ROBOTS.TXT] Checking {robots_url}")
 
-        # Critical paths that need to be allowed for successful scraping
+        # Critical paths needed for scraping
         critical_paths = {
             "products": ["/product", "/products", "/catalogue", "/catalog", "/item", "/vare"],
-            "cart": ["/cart", "/basket", "/kurv", "/shopping-cart", "/warenkorb"],
-            "checkout": ["/checkout", "/kasse", "/order", "/bestilling"],
+            "cart": ["/cart", "/basket", "/kurv"],
+            "checkout": ["/checkout", "/kasse", "/order"],
         }
 
         result = {
@@ -935,155 +1190,116 @@ class AnalyzerService:
             "blocked_paths": [],
             "allowed_paths": [],
             "warnings": [],
-            "robots_txt_content": None,
             "bot_protection_detected": False,
         }
 
-        # Create robots.txt log file
+        # Create log file
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d")
-        robots_log_file = log_dir / f"robots_txt_{timestamp}.log"
+        robots_log = log_dir / f"robots_txt_{timestamp}.log"
 
-        def log_to_file(message: str):
-            """Write to dedicated robots.txt log file"""
-            with open(robots_log_file, "a", encoding="utf-8") as f:
-                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        def log_to_file(msg: str):
+            with open(robots_log, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
 
         try:
             log_to_file(f"{'='*80}")
             log_to_file(f"CHECKING: {robots_url}")
-            log_to_file(f"BASE URL: {base_url}")
 
-            # Fetch robots.txt with proper User-Agent to avoid bot protection
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(robots_url, headers=headers, timeout=10) as response:
                     if response.status == 200:
-                        robots_content = await response.text()
-                        result["robots_txt_content"] = robots_content
-                        logger.info(f"[ROBOTS.TXT] Successfully fetched ({len(robots_content)} bytes)")
-                        log_to_file(f"STATUS: Successfully fetched ({len(robots_content)} bytes)")
-                        log_to_file(f"\nCONTENT:\n{robots_content}\n")
+                        content = await response.text()
+                        logger.info(f"[ROBOTS.TXT] Fetched ({len(content)} bytes)")
+                        log_to_file(f"STATUS: 200 OK\nCONTENT:\n{content}\n")
 
                         # Parse robots.txt
                         rp = urllib.robotparser.RobotFileParser()
-                        rp.parse(robots_content.splitlines())
-
-                        log_to_file(f"\nPATH ANALYSIS:")
-                        log_to_file(f"{'-'*80}")
+                        rp.parse(content.splitlines())
 
                         # Check critical paths
+                        log_to_file("PATH ANALYSIS:")
                         for category, paths in critical_paths.items():
-                            category_blocked = []
-                            category_allowed = []
-
-                            log_to_file(f"\nChecking {category.upper()} paths:")
-
                             for path in paths:
                                 test_url = urljoin(base_url, path)
                                 if rp.can_fetch("*", test_url):
-                                    category_allowed.append(path)
+                                    result["allowed_paths"].append(path)
                                     log_to_file(f"  ✓ ALLOWED: {path}")
                                 else:
-                                    category_blocked.append(path)
+                                    result["blocked_paths"].append(path)
                                     log_to_file(f"  ✗ BLOCKED: {path}")
 
-                            if category_blocked:
-                                result["blocked_paths"].extend(category_blocked)
-                                warning_msg = f"{category.upper()} paths blocked: {', '.join(category_blocked)}"
-                                result["warnings"].append(warning_msg)
-                                logger.warning(f"[ROBOTS.TXT] WARNING: {warning_msg}")
-                                log_to_file(f"\n⚠️  WARNING: {warning_msg}")
-
-                            if category_allowed:
-                                result["allowed_paths"].extend(category_allowed)
-                                logger.info(
-                                    f"[ROBOTS.TXT] ALLOWED: {category.upper()} paths - {', '.join(category_allowed)}"
-                                )
-
-                        # Determine overall status
-                        log_to_file(f"\n{'-'*80}")
-                        log_to_file(f"SUMMARY:")
-
+                        # Determine if scraping is allowed
                         if result["blocked_paths"]:
                             result["base_allowed"] = False
-                            result[
-                                "message"
-                            ] = f"Critical paths blocked by robots.txt: {', '.join(result['blocked_paths'])}"
-
-                            # Create user-friendly message
-                            blocked_categories = []
-                            if any(p in result["blocked_paths"] for p in critical_paths["products"]):
-                                blocked_categories.append("PRODUCTS")
-                            if any(p in result["blocked_paths"] for p in critical_paths["cart"]):
-                                blocked_categories.append("CART")
-                            if any(p in result["blocked_paths"] for p in critical_paths["checkout"]):
-                                blocked_categories.append("CHECKOUT")
-
-                            user_message = f"SCRAPING NOT ALLOWED - robots.txt blocks: {', '.join(blocked_categories)}"
-                            logger.error(f"[ROBOTS.TXT] *** {user_message} ***")
-                            logger.error(f"[ROBOTS.TXT] Blocked paths: {', '.join(result['blocked_paths'])}")
-                            logger.error(
-                                f"[ROBOTS.TXT] This site does not allow automated scraping of these critical paths."
-                            )
-                            logger.error(
-                                f"[ROBOTS.TXT] Recommendation: Contact site owner for API access or scraping permission."
-                            )
-
+                            result["message"] = f"Critical paths blocked: {', '.join(result['blocked_paths'])}"
+                            logger.error(f"[ROBOTS.TXT] *** {result['message']} ***")
                             log_to_file(f"RESULT: ⛔ SCRAPING NOT ALLOWED")
-                            log_to_file(f"BLOCKED CATEGORIES: {', '.join(blocked_categories)}")
-                            log_to_file(f"BLOCKED PATHS: {', '.join(result['blocked_paths'])}")
-                            log_to_file(
-                                f"ALLOWED PATHS: {', '.join(result['allowed_paths']) if result['allowed_paths'] else 'None'}"
-                            )
-                            log_to_file(f"RECOMMENDATION: Contact site owner for API access or permission")
-
-                            result["message"] = user_message
                         else:
-                            logger.info(f"[ROBOTS.TXT] SUCCESS: All critical paths are allowed for scraping")
-                            log_to_file(f"RESULT: ✅ SCRAPING ALLOWED")
-                            log_to_file(f"All critical paths ({len(result['allowed_paths'])}) are accessible")
-                            result["message"] = "All critical paths allowed"
+                            logger.info("[ROBOTS.TXT] [OK] All critical paths allowed")
+                            log_to_file("RESULT: ✅ SCRAPING ALLOWED")
 
-                        # Check for crawl delay
+                        # Check crawl delay
                         crawl_delay = rp.crawl_delay("*")
                         if crawl_delay:
                             result["crawl_delay"] = int(crawl_delay)
-                            logger.info(f"[ROBOTS.TXT] Crawl delay: {crawl_delay} seconds")
-                            log_to_file(f"CRAWL DELAY: {crawl_delay} seconds")
-                        else:
-                            log_to_file(f"CRAWL DELAY: None specified (using default)")
+                            logger.info(f"[ROBOTS.TXT] Crawl delay: {crawl_delay}s")
+                            log_to_file(f"CRAWL DELAY: {crawl_delay}s")
 
                     elif response.status == 404:
-                        logger.info(f"[ROBOTS.TXT] No robots.txt found (404) - assuming allowed")
-                        log_to_file(f"STATUS: 404 Not Found - No robots.txt file")
-                        log_to_file(f"RESULT: ✅ SCRAPING ALLOWED (no restrictions)")
-                        result["message"] = "No robots.txt (assumed allowed)"
+                        logger.info("[ROBOTS.TXT] No robots.txt (404) - allowed")
+                        log_to_file("STATUS: 404 - No robots.txt")
+                        result["message"] = "No robots.txt"
+
                     elif response.status == 403:
-                        logger.warning(f"[ROBOTS.TXT] 403 Forbidden - Bot protection detected")
-                        log_to_file(f"STATUS: 403 Forbidden - Bot protection blocking robots.txt access")
-                        log_to_file(f"RESULT: ⚠️ BOT PROTECTION DETECTED (assuming allowed but using stealth mode)")
-                        result["message"] = "Bot protection detected (403 on robots.txt)"
+                        logger.warning("[ROBOTS.TXT] 403 - Bot protection detected")
+                        log_to_file("STATUS: 403 - Bot protection")
                         result["bot_protection_detected"] = True
+                        result["message"] = "Bot protection detected"
+
                     else:
-                        logger.warning(f"[ROBOTS.TXT] Unexpected status {response.status} - assuming allowed")
-                        log_to_file(f"STATUS: {response.status} - Unexpected response")
-                        log_to_file(f"RESULT: ✅ SCRAPING ALLOWED (assuming no restrictions)")
-                        result["message"] = f"robots.txt status {response.status} (assumed allowed)"
+                        logger.warning(f"[ROBOTS.TXT] Status {response.status}")
+                        log_to_file(f"STATUS: {response.status}")
+                        result["message"] = f"Status {response.status}"
 
         except Exception as e:
-            logger.warning(f"[ROBOTS.TXT] Error checking robots.txt: {e} - assuming allowed")
+            logger.warning(f"[ROBOTS.TXT] Error: {e}")
             log_to_file(f"ERROR: {e}")
-            log_to_file(f"RESULT: ✅ SCRAPING ALLOWED (error occurred, assuming no restrictions)")
-            result["message"] = f"Error checking robots.txt: {e} (assumed allowed)"
+            result["message"] = f"Error: {e}"
 
         log_to_file(f"{'='*80}\n")
         return result
 
     async def _check_bot_protection(self, url: str) -> Dict:
-        """Check for bot protection"""
-        # Simplified - assume no protection
-        return {"detected": False, "types": [], "confidence": "low"}
+        """
+        Check for bot protection mechanisms.
+
+        Args:
+            url: URL to check
+
+        Returns:
+            Dictionary with bot protection information
+        """
+        # Simplified implementation - can be enhanced with actual detection logic
+        return {
+            "detected": False,
+            "types": [],
+            "confidence": "low"
+        }
+
+    # Legacy compatibility methods (kept for backward compatibility if needed)
+    async def discover_product_url(self, url: str, max_retries: int = 2) -> Optional[str]:
+        """Legacy method for backward compatibility."""
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        base_url = f"{parsed.scheme}://{domain}"
+        return await self._find_product_page(url, domain, base_url)
+
+    async def detect_universal_selectors(self, url: str) -> Dict[str, Optional[str]]:
+        """Legacy method for backward compatibility."""
+        return await self._detect_selectors(url)

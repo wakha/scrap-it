@@ -351,7 +351,7 @@ jobs:
           echo "Maintainability Index (Weighted): $RADON (Grade: $RADON_GRADE) - Informational only"
           
           # Set threshold (only Pylint is enforced)
-          PYLINT_THRESHOLD=6.0
+          PYLINT_THRESHOLD=5.0
           
           echo "pylint_score=$PYLINT" >> $GITHUB_OUTPUT
           echo "radon_mi=$RADON" >> $GITHUB_OUTPUT

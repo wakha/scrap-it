@@ -117,6 +117,12 @@ class Settings(BaseSettings):
         "/inspiration/",
         "/editorial/",
         "/magazine/",
+        "/gaver/",
+        "/gifts/",
+        "/influencer/",
+        "/fast-lav-pris/",  # Matas "fast low price" campaign
+        "/tilbud/",  # Danish "offers"
+        "/kampagne/",  # Danish "campaign"
     ]
 
     # Cookie Consent Selectors (Danish + English)
@@ -450,6 +456,7 @@ class Settings(BaseSettings):
     default_availability: str = "in stock"
 
     class Config:
+        """Pydantic configuration."""
         env_file = ".env"
         case_sensitive = False
         extra = "ignore"  # Ignore extra fields from .env

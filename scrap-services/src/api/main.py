@@ -1,19 +1,19 @@
 """FastAPI application for querying scraper database."""
 import sys
+import logging
 from pathlib import Path
+from typing import Optional, List
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select, func, desc, and_
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 # Add the project root to the Python path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
-
-from fastapi import FastAPI, HTTPException, Query, Header
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List
-from datetime import datetime
-from sqlalchemy import select, func, desc, and_
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-import logging
 
 from src.database.models import Product, ShippingProvider, ScraperLog
 from src.config import settings
@@ -39,9 +39,14 @@ app.add_middleware(
 )
 
 # Database setup
-DATABASE_URL = f"mysql+aiomysql://{settings.db_user}:{settings.db_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}"
+DATABASE_URL = (
+    f"mysql+aiomysql://{settings.db_user}:{settings.db_password}"
+    f"@{settings.db_host}:{settings.db_port}/{settings.db_name}"
+)
 engine = create_async_engine(DATABASE_URL, echo=False)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+AsyncSessionLocal = sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False
+)
 
 
 async def get_db():
