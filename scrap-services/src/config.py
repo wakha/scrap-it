@@ -117,6 +117,12 @@ class Settings(BaseSettings):
         "/inspiration/",
         "/editorial/",
         "/magazine/",
+        "/gaver/",
+        "/gifts/",
+        "/influencer/",
+        "/fast-lav-pris/",  # Matas "fast low price" campaign
+        "/tilbud/",  # Danish "offers"
+        "/kampagne/",  # Danish "campaign"
     ]
 
     # Cookie Consent Selectors (Danish + English)

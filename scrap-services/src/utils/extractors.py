@@ -109,12 +109,21 @@ class DataExtractor:
         # Pattern for delivery time (e.g., "2-3 days", "1-2 business days", "Next day")
         # Enhanced for Danish: "1-4 hverdage", "Få leveret fra i morgen", "Få leveret i dag"
         patterns = [
-            # Danish phrases for today/tomorrow delivery
-            (r"i\s+dag", "0 days"),  # "i dag" = today = 0 days
+            # Danish phrases for today/tomorrow delivery with "Få leveret"
+            (r"få\s+leveret\s+i\s+dag", "0 days"),  # "Få leveret i dag" = delivered today
+            (r"hent\s+pakken\s+i\s+dag", "0 days"),  # "Hent pakken i dag" = pick up today
+            (r"få\s+leveret\s+i\s+morgen", "1 day"),  # "Få leveret i morgen" = delivered tomorrow
+            (r"hent\s+pakken\s+i\s+morgen", "1 day"),  # "Hent pakken i morgen" = pick up tomorrow
+            (r"i\s+dag(?:\s+mellem)?", "0 days"),  # "i dag" or "i dag mellem 18:00 og 22:00"
             (r"samme\s+dag", "0 days"),  # "samme dag" = same day = 0 days
             (r"fra\s+i\s+morgen", "1 day"),  # "fra i morgen" = from tomorrow = 1 day
             (r"i\s+morgen", "1 day"),  # "i morgen" = tomorrow = 1 day
             (r"næste\s+dag", "1 day"),  # "næste dag" = next day = 1 day
+            
+            # Danish patterns with "tager normalt"
+            (r"tager\s+normalt\s+(\d+[-–]\d+)\s*arbejdsdage?", None),  # "tager normalt 2-4 arbejdsdage"
+            (r"leveringstiden\s+tager\s+normalt\s+(\d+[-–]\d+)\s*arbejdsdage?", None),  # "Leveringstiden tager normalt 2-4 arbejdsdage"
+            (r"tager\s+normalt\s+(\d+)\s*arbejdsdage?", None),  # "tager normalt 2 arbejdsdage"
             
             # Standard delivery time ranges
             (r"(\d+[-–]\d+)\s*hverdage?", None),  # Danish: "1-4 hverdage"
@@ -139,6 +148,7 @@ class DataExtractor:
             (r"next\s*day", "1 day"),  # "next day"
             (r"same\s*day", "0 days"),  # "same day"
             (r"express", "1-2 days"),  # "express" usually means 1-2 days
+            (r"ekspres", "1-2 days"),  # Danish: "ekspres" = express
             (r"hurtig\s*levering", "1-2 days"),  # Danish: "hurtig levering" = fast delivery
             
             # Hours-based delivery
