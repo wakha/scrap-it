@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scraper-service
+  namespace: scraper-microservices
+  labels:
+    app: scraper-service
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: scraper-service
+  template:
+    metadata:
+      labels:
+        app: scraper-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9002"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: scraper
+        image: <your-acr-name>.azurecr.io/scraper-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 9002
+          name: metrics
+        env:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          valueFrom:
+            configMapKeyRef:
+              name: kafka-config
+              key: KAFKA_BOOTSTRAP_SERVERS
+        - name: HEADLESS_MODE
+          value: "true"
+        - name: SCREENSHOT_ENABLED
+          value: "false"
+        - name: METRICS_PORT
+          value: "9002"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: screenshots
+          mountPath: /app/screenshots
+      volumes:
+      - name: screenshots
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scraper-service
+  namespace: scraper-microservices
+  labels:
+    app: scraper-service
+spec:
+  selector:
+    app: scraper-service
+  ports:
+  - name: metrics
+    protocol: TCP
+    port: 9002
+    targetPort: 9002
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: scraper-service-hpa
+  namespace: scraper-microservices
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: scraper-service
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

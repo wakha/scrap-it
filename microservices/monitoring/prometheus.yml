@@ -1,0 +1,56 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # API Gateway metrics
+  - job_name: 'api-gateway'
+    static_configs:
+      - targets: ['api-gateway:9000']
+        labels:
+          service: 'api-gateway'
+
+  # Analyzer Service metrics (with replicas)
+  - job_name: 'analyzer-service'
+    dns_sd_configs:
+      - names:
+          - 'analyzer-service'
+        type: 'A'
+        port: 9001
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - replacement: 'analyzer-service'
+        target_label: service
+
+  # Scraper Service metrics (with replicas)
+  # Docker Compose will load balance across replicas automatically
+  - job_name: 'scraper-service'
+    dns_sd_configs:
+      - names:
+          - 'scraper-service'
+        type: 'A'
+        port: 9002
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - replacement: 'scraper-service'
+        target_label: service
+
+  # ETL Service metrics (with replicas)
+  - job_name: 'etl-service'
+    dns_sd_configs:
+      - names:
+          - 'etl-service'
+        type: 'A'
+        port: 9003
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - replacement: 'etl-service'
+        target_label: service
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

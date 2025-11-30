@@ -1,0 +1,166 @@
+# MySQL Deployment (Owned by ETL Service)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: scraper-microservices
+  labels:
+    app: mysql
+    owner: etl-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "rootpassword"  # Use secrets in production
+        - name: MYSQL_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: database-config
+              key: DB_NAME
+        - name: MYSQL_USER
+          valueFrom:
+            configMapKeyRef:
+              name: database-config
+              key: DB_USER
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: database-secret
+              key: DB_PASSWORD
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: mysql-data
+          mountPath: /var/lib/mysql
+        - name: init-script
+          mountPath: /docker-entrypoint-initdb.d
+        livenessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: mysql-data
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+      - name: init-script
+        configMap:
+          name: mysql-init-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: scraper-microservices
+  labels:
+    app: mysql
+spec:
+  selector:
+    app: mysql
+  ports:
+  - protocol: TCP
+    port: 3306
+    targetPort: 3306
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: scraper-microservices
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: managed-premium  # Azure Premium SSD
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-script
+  namespace: scraper-microservices
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS products (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(500) NOT NULL,
+        price DECIMAL(10, 2) NOT NULL,
+        currency VARCHAR(10) NOT NULL,
+        url TEXT NOT NULL,
+        source_website VARCHAR(255) NOT NULL,
+        screenshot_path TEXT,
+        scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_source_website (source_website),
+        INDEX idx_scraped_at (scraped_at)
+    );
+
+    CREATE TABLE IF NOT EXISTS shipping_providers (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        product_id INT NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        price DECIMAL(10, 2),
+        currency VARCHAR(10),
+        delivery_time VARCHAR(255),
+        delivery_type VARCHAR(100),
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+        INDEX idx_product_id (product_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS scraper_logs (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        website VARCHAR(255) NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        started_at TIMESTAMP NOT NULL,
+        completed_at TIMESTAMP NOT NULL,
+        duration_seconds DECIMAL(10, 2),
+        error_message TEXT,
+        products_discovered INT DEFAULT 0,
+        products_scraped INT DEFAULT 0,
+        robots_txt_allowed BOOLEAN,
+        robots_txt_message TEXT,
+        bot_protection_detected BOOLEAN,
+        protection_types VARCHAR(500),
+        protection_confidence VARCHAR(50),
+        crawl_delay INT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_website (website),
+        INDEX idx_status (status),
+        INDEX idx_started_at (started_at)
+    );
